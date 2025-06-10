@@ -16,14 +16,22 @@
 
 package android.net.ip;
 
+import static android.net.INetd.LOCAL_NET_ID;
 import static android.net.RouteInfo.RTN_UNICAST;
 import static android.net.TetheringManager.CONNECTIVITY_SCOPE_GLOBAL;
 import static android.net.TetheringManager.CONNECTIVITY_SCOPE_LOCAL;
+import static android.net.TetheringManager.TETHERING_BLUETOOTH;
+import static android.net.TetheringManager.TETHERING_ETHERNET;
+import static android.net.TetheringManager.TETHERING_NCM;
+import static android.net.TetheringManager.TETHERING_WIFI;
+import static android.net.TetheringManager.TETHERING_WIFI_P2P;
+import static android.net.TetheringManager.TETHERING_WIGIG;
 import static android.net.TetheringManager.TETHER_ERROR_DHCPSERVER_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_ENABLE_FORWARDING_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_IFACE_CFG_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_INTERNAL_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_NO_ERROR;
+import static android.net.TetheringManager.TETHER_ERROR_SERVICE_UNAVAIL;
 import static android.net.TetheringManager.TETHER_ERROR_TETHER_IFACE_ERROR;
 import static android.net.TetheringManager.TETHER_ERROR_UNTETHER_IFACE_ERROR;
 import static android.net.TetheringManager.TetheringRequest.checkStaticAddressConfiguration;
@@ -33,20 +41,25 @@ import static android.system.OsConstants.RT_SCOPE_UNIVERSE;
 
 import static com.android.net.module.util.Inet4AddressUtils.intToInet4AddressHTH;
 import static com.android.net.module.util.NetworkStackConstants.RFC7421_PREFIX_LENGTH;
+import static com.android.networkstack.tethering.TetheringConfiguration.TETHERING_LOCAL_NETWORK_AGENT;
 import static com.android.networkstack.tethering.TetheringConfiguration.USE_SYNC_SM;
 import static com.android.networkstack.tethering.util.PrefixUtils.asIpPrefix;
 import static com.android.networkstack.tethering.util.TetheringMessageBase.BASE_IPSERVER;
+import static com.android.networkstack.tethering.util.TetheringUtils.getTransportTypeForTetherableType;
 
+import android.annotation.SuppressLint;
+import android.content.Context;
 import android.net.INetd;
 import android.net.INetworkStackStatusCallback;
 import android.net.IpPrefix;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.MacAddress;
+import android.net.NetworkAgent;
 import android.net.RouteInfo;
 import android.net.TetheredClient;
-import android.net.TetheringManager;
 import android.net.TetheringManager.TetheringRequest;
+import android.net.connectivity.ConnectivityInternalApiUtil;
 import android.net.dhcp.DhcpLeaseParcelable;
 import android.net.dhcp.DhcpServerCallbacks;
 import android.net.dhcp.DhcpServingParamsParcel;
@@ -54,7 +67,9 @@ import android.net.dhcp.DhcpServingParamsParcelExt;
 import android.net.dhcp.IDhcpEventCallbacks;
 import android.net.dhcp.IDhcpServer;
 import android.net.ip.RouterAdvertisementDaemon.RaParams;
+import android.os.Build;
 import android.os.Handler;
+import android.os.Looper;
 import android.os.Message;
 import android.os.RemoteException;
 import android.os.ServiceSpecificException;
@@ -64,11 +79,13 @@ import android.util.SparseArray;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.util.MessageUtils;
 import com.android.internal.util.State;
 import com.android.modules.utils.build.SdkLevel;
+import com.android.net.module.util.DeviceConfigUtils;
 import com.android.net.module.util.IIpv4PrefixRequest;
 import com.android.net.module.util.InterfaceParams;
 import com.android.net.module.util.NetdUtils;
@@ -168,10 +185,10 @@ public class IpServer extends StateMachineShim {
         /**
          * Request Tethering change.
          *
-         * @param request the TetheringRequest this IpServer was enabled with.
+         * @param tetheringType the downstream type of this IpServer.
          * @param enabled enable or disable tethering.
          */
-        public void requestEnableTethering(TetheringRequest request, boolean enabled) { }
+        public void requestEnableTethering(int tetheringType, boolean enabled) { }
     }
 
     /** Capture IpServer dependencies, for injection. */
@@ -198,6 +215,23 @@ public class IpServer extends StateMachineShim {
         /** Create a DhcpServer instance to be used by IpServer. */
         public abstract void makeDhcpServer(String ifName, DhcpServingParamsParcel params,
                 DhcpServerCallbacks cb);
+
+        /**
+         * @see DeviceConfigUtils#isTetheringFeatureEnabled
+         */
+        public boolean isFeatureEnabled(Context context, String name) {
+            return DeviceConfigUtils.isTetheringFeatureEnabled(context, name);
+        }
+
+        /** Create a NetworkAgent instance to be used by IpServer. */
+        @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+        @SuppressLint("NewApi")
+        public NetworkAgent makeNetworkAgent(
+                @NonNull Context context, @NonNull Looper looper, @NonNull String logTag,
+                int interfaceType, @NonNull LinkProperties lp) {
+            return ConnectivityInternalApiUtil.buildTetheringNetworkAgent(
+                    context, looper, logTag, getTransportTypeForTetherableType(interfaceType), lp);
+        }
     }
 
     // request from the user that it wants to tether
@@ -298,16 +332,28 @@ public class IpServer extends StateMachineShim {
 
     private final TetheringMetrics mTetheringMetrics;
     private final Handler mHandler;
+    private final Context mContext;
+
+    private final boolean mSupportLocalAgent;
+
+    // This will be null if the TetheredState is not entered or feature not supported.
+    // This will be only accessed from the IpServer handler thread.
+    private NetworkAgent mTetheringAgent;
+
+    private static boolean everRegistered(@NonNull NetworkAgent agent) {
+        return agent.getNetwork() != null;
+    }
 
     // TODO: Add a dependency object to pass the data members or variables from the tethering
     // object. It helps to reduce the arguments of the constructor.
     public IpServer(
-            String ifaceName, Handler handler, int interfaceType, SharedLog log,
-            INetd netd, @NonNull BpfCoordinator bpfCoordinator,
+            String ifaceName, @NonNull Context context, Handler handler, int interfaceType,
+            SharedLog log, INetd netd, @NonNull BpfCoordinator bpfCoordinator,
             RoutingCoordinatorManager routingCoordinatorManager, Callback callback,
             TetheringConfiguration config,
             TetheringMetrics tetheringMetrics, Dependencies deps) {
         super(ifaceName, USE_SYNC_SM ? null : handler.getLooper());
+        mContext = Objects.requireNonNull(context);
         mHandler = handler;
         mLog = log.forSubComponent(ifaceName);
         mNetd = netd;
@@ -332,6 +378,10 @@ public class IpServer extends StateMachineShim {
         resetLinkProperties();
         mLastError = TETHER_ERROR_NO_ERROR;
         mServingMode = STATE_AVAILABLE;
+
+        // Tethering network agent is supported on V+, and will be rolled out gradually.
+        mSupportLocalAgent = SdkLevel.isAtLeastV()
+                && mDeps.isFeatureEnabled(mContext, TETHERING_LOCAL_NETWORK_AGENT);
 
         mInitialState = new InitialState();
         mLocalHotspotState = new LocalHotspotState();
@@ -409,12 +459,6 @@ public class IpServer extends StateMachineShim {
         return mIpv4PrefixRequest;
     }
 
-    /** The TetheringRequest the IpServer started with. */
-    @Nullable
-    public TetheringRequest getTetheringRequest() {
-        return mTetheringRequest;
-    }
-
     /**
      * Get the latest list of DHCP leases that was reported. Must be called on the IpServer looper
      * thread.
@@ -423,9 +467,11 @@ public class IpServer extends StateMachineShim {
         return Collections.unmodifiableList(mDhcpLeases);
     }
 
-    /** Enable this IpServer. IpServer state machine will be tethered or localHotspot state. */
-    public void enable(final int requestedState, final TetheringRequest request) {
-        sendMessage(CMD_TETHER_REQUESTED, requestedState, 0, request);
+    /**
+     * Enable this IpServer. IpServer state machine will be tethered or localHotspot state based on
+     * the connectivity scope of the TetheringRequest. */
+    public void enable(@NonNull final TetheringRequest request) {
+        sendMessage(CMD_TETHER_REQUESTED, 0, 0, request);
     }
 
     /** Stop this IpServer. After this is called this IpServer should not be used any more. */
@@ -589,8 +635,8 @@ public class IpServer extends StateMachineShim {
             @NonNull final Inet4Address dnsServer, @NonNull LinkAddress serverAddr,
             @Nullable Inet4Address clientAddr) {
         final boolean changePrefixOnDecline =
-                (mInterfaceType == TetheringManager.TETHERING_NCM && clientAddr == null);
-        final int subnetPrefixLength = mInterfaceType == TetheringManager.TETHERING_WIFI_P2P
+                (mInterfaceType == TETHERING_NCM && clientAddr == null);
+        final int subnetPrefixLength = mInterfaceType == TETHERING_WIFI_P2P
                 ? mP2pLeasesSubnetPrefixLength : 0 /* default value */;
 
         return new DhcpServingParamsParcelExt()
@@ -690,10 +736,10 @@ public class IpServer extends StateMachineShim {
         final IpPrefix ipv4Prefix = asIpPrefix(mIpv4Address);
 
         final Boolean setIfaceUp;
-        if (mInterfaceType == TetheringManager.TETHERING_WIFI
-                || mInterfaceType == TetheringManager.TETHERING_WIFI_P2P
-                || mInterfaceType == TetheringManager.TETHERING_ETHERNET
-                || mInterfaceType == TetheringManager.TETHERING_WIGIG) {
+        if (mInterfaceType == TETHERING_WIFI
+                || mInterfaceType == TETHERING_WIFI_P2P
+                || mInterfaceType == TETHERING_ETHERNET
+                || mInterfaceType == TETHERING_WIGIG) {
             // The WiFi and Ethernet stack has ownership of the interface up/down state.
             // It is unclear whether the Bluetooth or USB stacks will manage their own
             // state.
@@ -719,12 +765,12 @@ public class IpServer extends StateMachineShim {
 
     private boolean shouldNotConfigureBluetoothInterface() {
         // Before T, bluetooth tethering configures the interface elsewhere.
-        return (mInterfaceType == TetheringManager.TETHERING_BLUETOOTH) && !SdkLevel.isAtLeastT();
+        return (mInterfaceType == TETHERING_BLUETOOTH) && !SdkLevel.isAtLeastT();
     }
 
     private boolean shouldUseWifiP2pDedicatedIp() {
         return mIsWifiP2pDedicatedIpEnabled
-                && mInterfaceType == TetheringManager.TETHERING_WIFI_P2P;
+                && mInterfaceType == TETHERING_WIFI_P2P;
     }
 
     private LinkAddress requestIpv4Address(final int scope, final boolean useLastAddress) {
@@ -785,6 +831,7 @@ public class IpServer extends StateMachineShim {
     //
     // TODO: Evaluate using a data structure than is more directly suited to
     // communicating only the relevant information.
+    @SuppressLint("NewApi")
     private void updateUpstreamIPv6LinkProperties(LinkProperties v6only, int ttlAdjustment) {
         if (mRaDaemon == null) return;
 
@@ -844,15 +891,12 @@ public class IpServer extends StateMachineShim {
         }
     }
 
-    private void removeRoutesFromLocalNetwork(@NonNull final List<RouteInfo> toBeRemoved) {
-        final int removalFailures = NetdUtils.removeRoutesFromLocalNetwork(
-                mNetd, toBeRemoved);
+    private void removeRoutesFromNetwork(int netId, @NonNull final List<RouteInfo> toBeRemoved) {
+        final int removalFailures = NetdUtils.removeRoutesFromNetwork(mNetd, netId, toBeRemoved);
         if (removalFailures > 0) {
-            mLog.e(String.format("Failed to remove %d IPv6 routes from local table.",
-                    removalFailures));
+            mLog.e("Failed to remove " + removalFailures
+                    + " IPv6 routes from network " + netId + ".");
         }
-
-        for (RouteInfo route : toBeRemoved) mLinkProperties.removeRoute(route);
     }
 
     private void addInterfaceToNetwork(final int netId, @NonNull final String ifaceName) {
@@ -879,27 +923,31 @@ public class IpServer extends StateMachineShim {
         }
     }
 
-    private void addRoutesToLocalNetwork(@NonNull final List<RouteInfo> toBeAdded) {
+    private void addRoutesToNetwork(int netId,
+            @NonNull final List<RouteInfo> toBeAdded) {
         // It's safe to call addInterfaceToNetwork() even if
-        // the interface is already in the local_network.
-        addInterfaceToNetwork(INetd.LOCAL_NET_ID, mIfaceName);
+        // the interface is already in the network.
+        addInterfaceToNetwork(netId, mIfaceName);
         try {
             // Add routes from local network. Note that adding routes that
             // already exist does not cause an error (EEXIST is silently ignored).
-            NetdUtils.addRoutesToLocalNetwork(mNetd, mIfaceName, toBeAdded);
+            NetdUtils.addRoutesToNetwork(mNetd, netId, mIfaceName, toBeAdded);
         } catch (IllegalStateException e) {
             mLog.e("Failed to add IPv4/v6 routes to local table: " + e);
             return;
         }
-
-        for (RouteInfo route : toBeAdded) mLinkProperties.addRoute(route);
     }
 
     private void configureLocalIPv6Routes(
             ArraySet<IpPrefix> deprecatedPrefixes, ArraySet<IpPrefix> newPrefixes) {
         // [1] Remove the routes that are deprecated.
         if (!deprecatedPrefixes.isEmpty()) {
-            removeRoutesFromLocalNetwork(getLocalRoutesFor(mIfaceName, deprecatedPrefixes));
+            final List<RouteInfo> routesToBeRemoved =
+                    getLocalRoutesFor(mIfaceName, deprecatedPrefixes);
+            if (mTetheringAgent == null) {
+                removeRoutesFromNetwork(LOCAL_NET_ID, routesToBeRemoved);
+            }
+            for (RouteInfo route : routesToBeRemoved) mLinkProperties.removeRoute(route);
         }
 
         // [2] Add only the routes that have not previously been added.
@@ -910,7 +958,12 @@ public class IpServer extends StateMachineShim {
             }
 
             if (!addedPrefixes.isEmpty()) {
-                addRoutesToLocalNetwork(getLocalRoutesFor(mIfaceName, addedPrefixes));
+                final List<RouteInfo> routesToBeAdded =
+                        getLocalRoutesFor(mIfaceName, addedPrefixes);
+                if (mTetheringAgent == null) {
+                    addRoutesToNetwork(LOCAL_NET_ID, routesToBeAdded);
+                }
+                for (RouteInfo route : routesToBeAdded) mLinkProperties.addRoute(route);
             }
         }
     }
@@ -1016,11 +1069,11 @@ public class IpServer extends StateMachineShim {
         mLinkProperties.setInterfaceName(mIfaceName);
     }
 
-    private void maybeConfigureStaticIp(final TetheringRequest request) {
+    private void maybeConfigureStaticIp(@NonNull final TetheringRequest request) {
         // Ignore static address configuration if they are invalid or null. In theory, static
         // addresses should not be invalid here because TetheringManager do not allow caller to
         // specify invalid static address configuration.
-        if (request == null || request.getLocalIpv4Address() == null
+        if (request.getLocalIpv4Address() == null
                 || request.getClientStaticIpv4Address() == null || !checkStaticAddressConfiguration(
                 request.getLocalIpv4Address(), request.getClientStaticIpv4Address())) {
             return;
@@ -1043,13 +1096,13 @@ public class IpServer extends StateMachineShim {
                 case CMD_TETHER_REQUESTED:
                     mLastError = TETHER_ERROR_NO_ERROR;
                     mTetheringRequest = (TetheringRequest) message.obj;
-                    switch (message.arg1) {
-                        case STATE_LOCAL_ONLY:
-                            maybeConfigureStaticIp((TetheringRequest) message.obj);
+                    switch (mTetheringRequest.getConnectivityScope()) {
+                        case CONNECTIVITY_SCOPE_LOCAL:
+                            maybeConfigureStaticIp(mTetheringRequest);
                             transitionTo(mLocalHotspotState);
                             break;
-                        case STATE_TETHERED:
-                            maybeConfigureStaticIp((TetheringRequest) message.obj);
+                        case CONNECTIVITY_SCOPE_GLOBAL:
+                            maybeConfigureStaticIp(mTetheringRequest);
                             transitionTo(mTetheredState);
                             break;
                         default:
@@ -1107,14 +1160,45 @@ public class IpServer extends StateMachineShim {
             return CONNECTIVITY_SCOPE_LOCAL;
         }
 
+        @SuppressLint("NewApi")
         private void startServingInterface() {
+            // TODO: Enable Network Agent for Wifi P2P Group Owner mode when Network Agent
+            //  for Group Client mode is supported.
+            if (mSupportLocalAgent && getScope() == CONNECTIVITY_SCOPE_GLOBAL) {
+                try {
+                    mTetheringAgent = mDeps.makeNetworkAgent(mContext, Looper.myLooper(), TAG,
+                            mInterfaceType, mLinkProperties);
+                    // Entering CONNECTING state, the ConnectivityService will create the
+                    // native network.
+                    mTetheringAgent.register();
+                } catch (RuntimeException e) {
+                    mLog.e("Error Creating Local Network", e);
+                    // If an exception occurs during the creation or registration of the
+                    // NetworkAgent, it typically indicates a problem with the system services.
+                    mLastError = TETHER_ERROR_SERVICE_UNAVAIL;
+                    return;
+                }
+            }
+
             if (!startIPv4(getScope())) {
                 mLastError = TETHER_ERROR_IFACE_CFG_ERROR;
                 return;
             }
 
             try {
-                NetdUtils.tetherInterface(mNetd, mIfaceName, asIpPrefix(mIpv4Address));
+                // Enable IPv6, disable accepting RA, etc. See TetherController::tetherInterface()
+                // for more detail.
+                mNetd.tetherInterfaceAdd(mIfaceName);
+                if (mTetheringAgent == null) {
+                    NetdUtils.networkAddInterface(mNetd, LOCAL_NET_ID, mIfaceName,
+                            20 /* maxAttempts */, 50 /* pollingIntervalMs */);
+                    // Activate a route to dest and IPv6 link local.
+                    NetdUtils.modifyRoute(mNetd, NetdUtils.ModifyOperation.ADD, LOCAL_NET_ID,
+                            new RouteInfo(asIpPrefix(mIpv4Address), null, mIfaceName, RTN_UNICAST));
+                    NetdUtils.modifyRoute(mNetd, NetdUtils.ModifyOperation.ADD, LOCAL_NET_ID,
+                            new RouteInfo(new IpPrefix("fe80::/64"), null, mIfaceName,
+                                    RTN_UNICAST));
+                }
             } catch (RemoteException | ServiceSpecificException | IllegalStateException e) {
                 mLog.e("Error Tethering", e);
                 mLastError = TETHER_ERROR_TETHER_IFACE_ERROR;
@@ -1126,17 +1210,32 @@ public class IpServer extends StateMachineShim {
                 // TODO: Make this a fatal error once Bluetooth IPv6 is sorted.
                 return;
             }
+
+            if (mTetheringAgent != null && everRegistered(mTetheringAgent)) {
+                mTetheringAgent.sendLinkProperties(mLinkProperties);
+                // Mark it connected to notify the applications for
+                // the network availability.
+                mTetheringAgent.markConnected();
+            }
         }
 
         @Override
+        @SuppressLint("NewApi")
         public void exit() {
             // Note that at this point, we're leaving the tethered state.  We can fail any
             // of these operations, but it doesn't really change that we have to try them
             // all in sequence.
             stopIPv6();
 
+            // Reset interface for tethering.
             try {
-                NetdUtils.untetherInterface(mNetd, mIfaceName);
+                try {
+                    mNetd.tetherInterfaceRemove(mIfaceName);
+                } finally {
+                    if (mTetheringAgent == null) {
+                        mNetd.networkRemoveInterface(LOCAL_NET_ID, mIfaceName);
+                    }
+                }
             } catch (RemoteException | ServiceSpecificException e) {
                 mLastError = TETHER_ERROR_UNTETHER_IFACE_ERROR;
                 mLog.e("Failed to untether interface: " + e);
@@ -1144,6 +1243,11 @@ public class IpServer extends StateMachineShim {
 
             stopIPv4();
             mBpfCoordinator.removeIpServer(IpServer.this);
+
+            if (mTetheringAgent != null && everRegistered(mTetheringAgent)) {
+                mTetheringAgent.unregister();
+                mTetheringAgent = null;
+            }
 
             resetLinkProperties();
 
@@ -1164,6 +1268,12 @@ public class IpServer extends StateMachineShim {
                     break;
                 case CMD_IPV6_TETHER_UPDATE:
                     updateUpstreamIPv6LinkProperties((LinkProperties) message.obj, message.arg1);
+                    // Sends update to the NetworkAgent.
+                    // TODO: Refactor the callers of sendLinkProperties()
+                    //  and move these code into sendLinkProperties().
+                    if (mTetheringAgent != null && everRegistered(mTetheringAgent)) {
+                        mTetheringAgent.sendLinkProperties(mLinkProperties);
+                    }
                     sendLinkProperties();
                     break;
                 case CMD_IP_FORWARDING_ENABLE_ERROR:
@@ -1178,8 +1288,8 @@ public class IpServer extends StateMachineShim {
                     handleNewPrefixRequest((IpPrefix) message.obj);
                     break;
                 case CMD_NOTIFY_PREFIX_CONFLICT:
-                    mLog.i("restart tethering: " + mIfaceName);
-                    mCallback.requestEnableTethering(mTetheringRequest, false /* enabled */);
+                    mLog.i("restart tethering: " + mInterfaceType);
+                    mCallback.requestEnableTethering(mInterfaceType, false /* enabled */);
                     transitionTo(mWaitingForRestartState);
                     break;
                 case CMD_SERVICE_FAILED_TO_START:
@@ -1213,14 +1323,21 @@ public class IpServer extends StateMachineShim {
                 return;
             }
 
-            // Remove deprecated routes from local network.
-            removeRoutesFromLocalNetwork(
-                    Collections.singletonList(getDirectConnectedRoute(deprecatedLinkAddress)));
+            // Remove deprecated routes from downstream network.
+            final List<RouteInfo> routesToBeRemoved =
+                    List.of(getDirectConnectedRoute(deprecatedLinkAddress));
+            if (mTetheringAgent == null) {
+                removeRoutesFromNetwork(LOCAL_NET_ID, routesToBeRemoved);
+            }
+            for (RouteInfo route : routesToBeRemoved) mLinkProperties.removeRoute(route);
             mLinkProperties.removeLinkAddress(deprecatedLinkAddress);
 
-            // Add new routes to local network.
-            addRoutesToLocalNetwork(
-                    Collections.singletonList(getDirectConnectedRoute(mIpv4Address)));
+            // Add new routes to downstream network.
+            final List<RouteInfo> routesToBeAdded = List.of(getDirectConnectedRoute(mIpv4Address));
+            if (mTetheringAgent == null) {
+                addRoutesToNetwork(LOCAL_NET_ID, routesToBeAdded);
+            }
+            for (RouteInfo route : routesToBeAdded) mLinkProperties.addRoute(route);
             mLinkProperties.addLinkAddress(mIpv4Address);
 
             // Update local DNS caching server with new IPv4 address, otherwise, dnsmasq doesn't
@@ -1231,6 +1348,10 @@ public class IpServer extends StateMachineShim {
             } catch (ServiceSpecificException | RemoteException e) {
                 mLog.e("Failed to update local DNS caching server");
                 return;
+            }
+            // Sends update to the NetworkAgent.
+            if (mTetheringAgent != null && everRegistered(mTetheringAgent)) {
+                mTetheringAgent.sendLinkProperties(mLinkProperties);
             }
             sendLinkProperties();
 
@@ -1463,12 +1584,12 @@ public class IpServer extends StateMachineShim {
                 case CMD_TETHER_UNREQUESTED:
                     transitionTo(mInitialState);
                     mLog.i("Untethered (unrequested) and restarting " + mIfaceName);
-                    mCallback.requestEnableTethering(mTetheringRequest, true /* enabled */);
+                    mCallback.requestEnableTethering(mInterfaceType, true /* enabled */);
                     break;
                 case CMD_INTERFACE_DOWN:
                     transitionTo(mUnavailableState);
                     mLog.i("Untethered (interface down) and restarting " + mIfaceName);
-                    mCallback.requestEnableTethering(mTetheringRequest, true /* enabled */);
+                    mCallback.requestEnableTethering(mInterfaceType, true /* enabled */);
                     break;
                 default:
                     return false;

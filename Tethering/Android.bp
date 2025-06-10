@@ -58,11 +58,13 @@ java_defaults {
         ":framework-connectivity-shared-srcs",
         ":services-tethering-shared-srcs",
         ":statslog-connectivity-java-gen",
+        ":statslog-framework-connectivity-java-gen",
         ":statslog-tethering-java-gen",
     ],
     static_libs: [
         "androidx.annotation_annotation",
         "connectivity-net-module-utils-bpf",
+        "com.android.net.flags-aconfig-java",
         "modules-utils-build",
         "modules-utils-statemachine",
         "networkstack-client",

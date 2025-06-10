@@ -36,6 +36,7 @@ import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.ParcelFileDescriptor.AutoCloseInputStream
 import android.telephony.TelephonyManager
 import android.telephony.TelephonyManager.SIM_STATE_UNKNOWN
 import android.util.Log
@@ -43,9 +44,14 @@ import androidx.annotation.RequiresApi
 import androidx.test.platform.app.InstrumentationRegistry
 import com.android.modules.utils.build.SdkLevel.isAtLeastS
 import java.io.ByteArrayOutputStream
+import java.io.CharArrayWriter
 import java.io.File
-import java.io.FileOutputStream
+import java.io.FileReader
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.OutputStreamWriter
 import java.io.PrintWriter
+import java.io.Reader
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.CompletableFuture
@@ -80,7 +86,38 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         var instance: ConnectivityDiagnosticsCollector? = null
     }
 
+    /**
+     * Indicates tcpdump should be started and written to the diagnostics file on test case failure.
+     */
+    annotation class CollectTcpdumpOnFailure
+
+    private class DumpThread(
+        // Keep a reference to the ParcelFileDescriptor otherwise GC would close it
+        private val fd: ParcelFileDescriptor,
+        private val reader: Reader
+    ) : Thread() {
+        private val writer = CharArrayWriter()
+        override fun run() {
+            reader.copyTo(writer)
+        }
+
+        fun closeAndWriteTo(output: OutputStream?) {
+            join()
+            fd.close()
+            if (output != null) {
+                val outputWriter = OutputStreamWriter(output)
+                outputWriter.write("--- tcpdump stopped at ${ZonedDateTime.now()} ---\n")
+                writer.writeTo(outputWriter)
+            }
+        }
+    }
+
+    private data class TcpdumpRun(val pid: Int, val reader: DumpThread)
+
     private var failureHeader: String? = null
+
+    // Accessed from the test listener methods which are synchronized by junit (see TestListener)
+    private var tcpdumpRun: TcpdumpRun? = null
     private val buffer = ByteArrayOutputStream()
     private val failureHeaderExtras = mutableMapOf<String, Any>()
     private val collectorDir: File by lazy {
@@ -132,7 +169,8 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
                     .addCapability(NET_CAPABILITY_INTERNET)
                     .addTransportType(TRANSPORT_WIFI)
                     .addTransportType(TRANSPORT_CELLULAR)
-                    .build(), networkCallback
+                    .build(),
+                networkCallback
             )
         }
     }
@@ -148,16 +186,69 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         // when iterating on failing tests.
         if (!runOnFailure(failure.exception)) return
         if (outputFiles.size >= MAX_DUMPS) return
-        Log.i(TAG, "Collecting diagnostics for test failure. Disable by running tests with: " +
+        Log.i(
+            TAG,
+            "Collecting diagnostics for test failure. Disable by running tests with: " +
                 "atest MyModule -- " +
-                "--module-arg MyModule:instrumentation-arg:$ARG_RUN_ON_FAILURE:=false")
+                "--module-arg MyModule:instrumentation-arg:$ARG_RUN_ON_FAILURE:=false"
+        )
         collectTestFailureDiagnostics(failure.exception)
 
         val baseFilename = "${description.className}#${description.methodName}_failure"
         flushBufferToFileMetric(testData, baseFilename)
     }
 
+    override fun onTestStart(testData: DataRecord, description: Description) {
+        val tcpdumpAnn = description.annotations.firstOrNull { it is CollectTcpdumpOnFailure }
+                as? CollectTcpdumpOnFailure
+        if (tcpdumpAnn != null) {
+            startTcpdumpForTestcaseIfSupported()
+        }
+    }
+
+    private fun startTcpdumpForTestcaseIfSupported() {
+        if (!DeviceInfoUtils.isDebuggable()) {
+            Log.d(TAG, "Cannot start tcpdump, build is not debuggable")
+            return
+        }
+        if (tcpdumpRun != null) {
+            Log.e(TAG, "Cannot start tcpdump: it is already running")
+            return
+        }
+        // executeShellCommand won't tokenize quoted arguments containing spaces (like pcap filters)
+        // properly, so pass in the command in stdin instead of using sh -c 'command'
+        val fds = instrumentation.uiAutomation.executeShellCommandRw("sh")
+
+        val stdout = fds[0]
+        val stdin = fds[1]
+        ParcelFileDescriptor.AutoCloseOutputStream(stdin).use { writer ->
+            // Echo the current pid, and replace it (with exec) with the tcpdump process, so the
+            // tcpdump pid is known.
+            writer.write(
+                "echo $$; exec su 0 tcpdump -n -i any -l -xx".encodeToByteArray()
+            )
+        }
+        val reader = FileReader(stdout.fileDescriptor).buffered()
+        val tcpdumpPid = Integer.parseInt(reader.readLine())
+        val dumpThread = DumpThread(stdout, reader)
+        dumpThread.start()
+        tcpdumpRun = TcpdumpRun(tcpdumpPid, dumpThread)
+    }
+
+    private fun stopTcpdumpIfRunning(output: OutputStream?) {
+        val run = tcpdumpRun ?: return
+        // Send SIGTERM for graceful shutdown of tcpdump so that it can flush its output
+        executeCommandBlocking("su 0 kill ${run.pid}")
+        run.reader.closeAndWriteTo(output)
+        tcpdumpRun = null
+    }
+
     override fun onTestEnd(testData: DataRecord, description: Description) {
+        // onTestFail is called before onTestEnd, so if the test failed tcpdump would already have
+        // been stopped and output dumped. Here this stops tcpdump if the test succeeded, throwing
+        // away its output.
+        stopTcpdumpIfRunning(output = null)
+
         // Tests may call methods like collectDumpsysConnectivity to collect diagnostics at any time
         // during the run, for example to observe state at various points to investigate a flake
         // and compare passing/failing cases.
@@ -190,12 +281,13 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         }
         val outFile = File(collectorDir, filename + FILENAME_SUFFIX)
         outputFiles.add(filename)
-        FileOutputStream(outFile).use { fos ->
+        getOutputStreamViaShell(outFile).use { fos ->
             failureHeader?.let {
                 fos.write(it.toByteArray())
                 fos.write("\n".toByteArray())
             }
             fos.write(buffer.toByteArray())
+            stopTcpdumpIfRunning(fos)
         }
         failureHeader = null
         buffer.reset()
@@ -239,8 +331,11 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
                 }
             }
         } else {
-            Log.w(TAG, "The test is still holding shell permissions, cannot collect privileged " +
-                    "device info")
+            Log.w(
+                TAG,
+                "The test is still holding shell permissions, cannot collect privileged " +
+                    "device info"
+            )
             headerObj.put("shellPermissionsUnavailable", true)
         }
         failureHeader = headerObj.apply {
@@ -292,7 +387,9 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
         cbHelper.registerNetworkCallback(
             NetworkRequest.Builder()
                 .addTransportType(TRANSPORT_WIFI)
-                .addCapability(NET_CAPABILITY_INTERNET).build(), cb)
+                .addCapability(NET_CAPABILITY_INTERNET).build(),
+            cb
+        )
         return try {
             cb.wifiInfoFuture.get(1L, TimeUnit.SECONDS)
         } catch (e: TimeoutException) {
@@ -323,16 +420,74 @@ class ConnectivityDiagnosticsCollector : BaseMetricListener() {
      * @param exceptionContext An exception to write a stacktrace to the dump for context.
      */
     fun collectDumpsysConnectivity(exceptionContext: Throwable? = null) {
-        Log.i(TAG, "Collecting dumpsys connectivity for test artifacts")
+        collectDumpsys("connectivity --dump-priority HIGH", exceptionContext)
+    }
+
+    /**
+     * Add a dumpsys to the test data dump.
+     *
+     * <p>The dump will be collected immediately, and exported to a test artifact file when the
+     * test ends.
+     * @param dumpsysCmd The dumpsys command to run (for example "connectivity").
+     * @param exceptionContext An exception to write a stacktrace to the dump for context.
+     */
+    fun collectDumpsys(dumpsysCmd: String, exceptionContext: Throwable? = null) =
+        collectCommandOutput("dumpsys $dumpsysCmd", exceptionContext = exceptionContext)
+
+    /**
+     * Add the output of a command to the test data dump.
+     *
+     * <p>The output will be collected immediately, and exported to a test artifact file when the
+     * test ends.
+     * @param cmd The command to run. Stdout of the command will be collected.
+     * @param shell The shell to run the command in, for example "sh".
+     * @param exceptionContext An exception to write a stacktrace to the dump for context.
+     */
+    @RequiresApi(Build.VERSION_CODES.S)
+    fun collectCommandOutput(
+        cmd: String,
+        shell: String,
+        exceptionContext: Throwable? = null
+    ) = collectCommandOutput(cmd, exceptionContext) { c, outputProcessor ->
+        runCommandInShell(c, shell, outputProcessor)
+    }
+
+    /**
+     * Add the output of a command to the test data dump.
+     *
+     * <p>The output will be collected immediately, and exported to a test artifact file when the
+     * test ends.
+     *
+     * <p>Note this does not support shell pipes, redirections, or quoted arguments. See the S+
+     * overload if that is needed.
+     * @param cmd The command to run. Stdout of the command will be collected.
+     * @param exceptionContext An exception to write a stacktrace to the dump for context.
+     */
+    fun collectCommandOutput(
+        cmd: String,
+        exceptionContext: Throwable? = null
+    ) = collectCommandOutput(cmd, exceptionContext) { c, outputProcessor ->
+        AutoCloseInputStream(
+            InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(c)
+        ).use {
+            outputProcessor(it)
+        }
+    }
+
+    private fun collectCommandOutput(
+        cmd: String,
+        exceptionContext: Throwable? = null,
+        commandRunner: (String, (InputStream) -> Unit) -> Unit
+    ) {
+        Log.i(TAG, "Collecting '$cmd' for test artifacts")
         PrintWriter(buffer).let {
-            it.println("--- Dumpsys connectivity at ${ZonedDateTime.now()} ---")
+            it.println("--- $cmd at ${ZonedDateTime.now()} ---")
             maybeWriteExceptionContext(it, exceptionContext)
             it.flush()
         }
-        ParcelFileDescriptor.AutoCloseInputStream(
-            InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(
-                "dumpsys connectivity --dump-priority HIGH")).use {
-            it.copyTo(buffer)
+
+        commandRunner(cmd) { stdout ->
+            stdout.copyTo(buffer)
         }
     }
 

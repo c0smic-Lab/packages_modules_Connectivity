@@ -17,28 +17,29 @@
 package android.net.thread;
 
 import static android.Manifest.permission.ACCESS_NETWORK_STATE;
-import static android.net.NetworkCapabilities.NET_CAPABILITY_LOCAL_NETWORK;
 import static android.net.thread.ThreadNetworkController.DEVICE_ROLE_DETACHED;
 import static android.net.thread.ThreadNetworkController.DEVICE_ROLE_LEADER;
 import static android.net.thread.ThreadNetworkController.DEVICE_ROLE_STOPPED;
 import static android.net.thread.utils.IntegrationTestUtils.CALLBACK_TIMEOUT;
-import static android.net.thread.utils.IntegrationTestUtils.DEFAULT_CONFIG;
-import static android.net.thread.utils.IntegrationTestUtils.RESTART_JOIN_TIMEOUT;
+import static android.net.thread.utils.IntegrationTestUtils.getIpv6Addresses;
 import static android.net.thread.utils.IntegrationTestUtils.getIpv6LinkAddresses;
-import static android.net.thread.utils.IntegrationTestUtils.getPrefixesFromNetData;
-import static android.net.thread.utils.IntegrationTestUtils.getThreadNetwork;
-import static android.net.thread.utils.IntegrationTestUtils.isInMulticastGroup;
 import static android.net.thread.utils.IntegrationTestUtils.waitFor;
+import static android.net.thread.utils.OtDaemonController.DIAG_VENDOR_MODEL_TLV_TYPE;
+import static android.net.thread.utils.OtDaemonController.DIAG_VENDOR_NAME_TLV_TYPE;
 import static android.net.thread.utils.ThreadNetworkControllerWrapper.JOIN_TIMEOUT;
+import static android.os.SystemClock.elapsedRealtime;
+
+import static androidx.test.platform.app.InstrumentationRegistry.getInstrumentation;
 
 import static com.android.compatibility.common.util.SystemUtil.runShellCommand;
 import static com.android.compatibility.common.util.SystemUtil.runShellCommandOrThrow;
-import static com.android.server.thread.openthread.IOtDaemon.TUN_IF_NAME;
 import static com.android.testutils.TestPermissionUtil.runAsShell;
 
 import static com.google.common.io.BaseEncoding.base16;
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
+
+import static org.junit.Assume.assumeTrue;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 
@@ -46,14 +47,13 @@ import android.content.Context;
 import android.net.ConnectivityManager;
 import android.net.InetAddresses;
 import android.net.IpPrefix;
-import android.net.LinkAddress;
-import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.net.thread.utils.FullThreadDevice;
 import android.net.thread.utils.OtDaemonController;
 import android.net.thread.utils.ThreadFeatureCheckerRule;
+import android.net.thread.utils.ThreadFeatureCheckerRule.RequiresSimulationThreadDevice;
 import android.net.thread.utils.ThreadFeatureCheckerRule.RequiresThreadFeature;
 import android.net.thread.utils.ThreadNetworkControllerWrapper;
 import android.net.thread.utils.ThreadStateListener;
@@ -62,6 +62,8 @@ import android.os.SystemClock;
 import androidx.test.core.app.ApplicationProvider;
 import androidx.test.filters.LargeTest;
 import androidx.test.runner.AndroidJUnit4;
+
+import com.google.common.collect.FluentIterable;
 
 import org.junit.After;
 import org.junit.Before;
@@ -92,10 +94,10 @@ public class ThreadIntegrationTest {
     // The maximum time for OT addresses to be propagated to the TUN interface "thread-wpan"
     private static final Duration TUN_ADDR_UPDATE_TIMEOUT = Duration.ofSeconds(1);
 
-    // The maximum time for changes to be propagated to netdata.
-    private static final Duration NET_DATA_UPDATE_TIMEOUT = Duration.ofSeconds(1);
-
     private static final Duration NETWORK_CALLBACK_TIMEOUT = Duration.ofSeconds(10);
+
+    // The duration between attached and addresses show up on thread-wpan
+    private static final Duration LINK_ADDR_TIMEOUT = Duration.ofSeconds(2);
 
     // A valid Thread Active Operational Dataset generated from OpenThread CLI "dataset init new".
     private static final byte[] DEFAULT_DATASET_TLVS =
@@ -107,11 +109,6 @@ public class ThreadIntegrationTest {
                                     + "B9D351B40C0402A0FFF8");
     private static final ActiveOperationalDataset DEFAULT_DATASET =
             ActiveOperationalDataset.fromThreadTlvs(DEFAULT_DATASET_TLVS);
-    private static final ThreadConfiguration DEFAULT_CONFIG =
-            new ThreadConfiguration.Builder().build();
-
-    private static final Inet6Address GROUP_ADDR_ALL_ROUTERS =
-            (Inet6Address) InetAddresses.parseNumericAddress("ff02::2");
 
     private static final String TEST_NO_SLAAC_PREFIX = "9101:dead:beef:cafe::/64";
     private static final InetAddress TEST_NO_SLAAC_PREFIX_ADDRESS =
@@ -128,14 +125,19 @@ public class ThreadIntegrationTest {
 
     @Before
     public void setUp() throws Exception {
+        getInstrumentation()
+                .getUiAutomation()
+                .grantRuntimePermission(
+                        "com.android.thread.tests.integration",
+                        "android.permission.NEARBY_WIFI_DEVICES");
+
         mExecutor = Executors.newSingleThreadExecutor();
-        mOtCtl = new OtDaemonController();
-        mController.leaveAndWait();
-
-        // TODO: b/323301831 - This is a workaround to avoid unnecessary delay to re-form a network
-        mOtCtl.factoryReset();
-
         mFtd = new FullThreadDevice(10 /* nodeId */);
+        mOtCtl = new OtDaemonController();
+        mController.setEnabledAndWait(true);
+        mController.setConfigurationAndWait(
+                new ThreadConfiguration.Builder().setBorderRouterEnabled(false).build());
+        mController.leaveAndWait();
     }
 
     @After
@@ -144,7 +146,6 @@ public class ThreadIntegrationTest {
 
         mController.setTestNetworkAsUpstreamAndWait(null);
         mController.leaveAndWait();
-        mController.setConfigurationAndWait(DEFAULT_CONFIG);
 
         mFtd.destroy();
         mExecutor.shutdownNow();
@@ -159,19 +160,6 @@ public class ThreadIntegrationTest {
         SystemClock.sleep(200);
 
         mController.waitForRole(DEVICE_ROLE_STOPPED, CALLBACK_TIMEOUT);
-    }
-
-    @Test
-    public void otDaemonRestart_JoinedNetworkAndStopped_autoRejoinedAndTunIfStateConsistent()
-            throws Exception {
-        mController.joinAndWait(DEFAULT_DATASET);
-
-        runShellCommand("stop ot-daemon");
-
-        mController.waitForRole(DEVICE_ROLE_DETACHED, CALLBACK_TIMEOUT);
-        mController.waitForRole(DEVICE_ROLE_LEADER, RESTART_JOIN_TIMEOUT);
-        assertThat(mOtCtl.isInterfaceUp()).isTrue();
-        assertThat(runShellCommand("ifconfig thread-wpan")).contains("UP POINTOPOINT RUNNING");
     }
 
     @Test
@@ -216,6 +204,8 @@ public class ThreadIntegrationTest {
 
     @Test
     public void otDaemonRestart_latestCountryCodeIsSetToOtDaemon() throws Exception {
+        assumeTrue(mOtCtl.isCountryCodeSupported());
+
         runThreadCommand("force-country-code enabled CN");
 
         runShellCommand("stop ot-daemon");
@@ -227,6 +217,7 @@ public class ThreadIntegrationTest {
     }
 
     @Test
+    @RequiresSimulationThreadDevice
     public void udp_appStartEchoServer_endDeviceUdpEchoSuccess() throws Exception {
         // Topology:
         //   Test App ------ thread-wpan ------ End Device
@@ -245,30 +236,25 @@ public class ThreadIntegrationTest {
     }
 
     @Test
-    public void joinNetworkWithBrDisabled_meshLocalAddressesArePreferred() throws Exception {
-        // When BR feature is disabled, there is no OMR address, so the mesh-local addresses are
-        // expected to be preferred.
-        mOtCtl.executeCommand("br disable");
+    public void joinNetwork_onlyMlEidIsPreferred() throws Exception {
         mController.joinAndWait(DEFAULT_DATASET);
+        waitFor(
+                () -> getIpv6Addresses("thread-wpan").contains(mOtCtl.getMlEid()),
+                LINK_ADDR_TIMEOUT);
 
         IpPrefix meshLocalPrefix = DEFAULT_DATASET.getMeshLocalPrefix();
-        List<LinkAddress> linkAddresses = getIpv6LinkAddresses("thread-wpan");
-        for (LinkAddress address : linkAddresses) {
-            if (meshLocalPrefix.contains(address.getAddress())) {
-                assertThat(address.getDeprecationTime())
-                        .isGreaterThan(SystemClock.elapsedRealtime());
-                assertThat(address.isPreferred()).isTrue();
-            }
-        }
-
-        mOtCtl.executeCommand("br enable");
-    }
-
-    @Test
-    public void joinNetwork_tunInterfaceJoinsAllRouterMulticastGroup() throws Exception {
-        mController.joinAndWait(DEFAULT_DATASET);
-
-        assertTunInterfaceMemberOfGroup(GROUP_ADDR_ALL_ROUTERS);
+        var linkAddrs = FluentIterable.from(getIpv6LinkAddresses("thread-wpan"));
+        var meshLocalAddrs = linkAddrs.filter(addr -> meshLocalPrefix.contains(addr.getAddress()));
+        var mlEidAddrs = meshLocalAddrs.filter(addr -> addr.getAddress().equals(mOtCtl.getMlEid()));
+        var nonMlEidAddrs = meshLocalAddrs.filter(addr -> !mlEidAddrs.contains(addr));
+        assertThat(mlEidAddrs).hasSize(1);
+        assertThat(mlEidAddrs.allMatch(addr -> addr.isPreferred())).isTrue();
+        assertThat(mlEidAddrs.allMatch(addr -> addr.getDeprecationTime() > elapsedRealtime()))
+                .isTrue();
+        assertThat(nonMlEidAddrs).isNotEmpty();
+        assertThat(nonMlEidAddrs.allMatch(addr -> !addr.isPreferred())).isTrue();
+        assertThat(nonMlEidAddrs.allMatch(addr -> addr.getDeprecationTime() <= elapsedRealtime()))
+                .isTrue();
     }
 
     @Test
@@ -286,6 +272,7 @@ public class ThreadIntegrationTest {
     }
 
     @Test
+    @RequiresSimulationThreadDevice
     public void edPingsMeshLocalAddresses_oneReplyPerRequest() throws Exception {
         mController.joinAndWait(DEFAULT_DATASET);
         startFtdChild(mFtd, DEFAULT_DATASET);
@@ -301,82 +288,27 @@ public class ThreadIntegrationTest {
     }
 
     @Test
-    public void addPrefixToNetData_routeIsAddedToTunInterface() throws Exception {
-        ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
-        mController.joinAndWait(DEFAULT_DATASET);
-
-        // Ftd child doesn't have the ability to add a prefix, so let BR itself add a prefix.
-        mOtCtl.executeCommand("prefix add " + TEST_NO_SLAAC_PREFIX + " pros med");
-        mOtCtl.executeCommand("netdata register");
-        waitFor(
-                () -> {
-                    String netData = mOtCtl.executeCommand("netdata show");
-                    return getPrefixesFromNetData(netData).contains(TEST_NO_SLAAC_PREFIX);
-                },
-                NET_DATA_UPDATE_TIMEOUT);
-
-        LinkProperties lp = cm.getLinkProperties(getThreadNetwork(CALLBACK_TIMEOUT));
-        assertThat(lp).isNotNull();
-        assertThat(lp.getRoutes().stream().anyMatch(r -> r.matches(TEST_NO_SLAAC_PREFIX_ADDRESS)))
-                .isTrue();
-    }
-
-    @Test
-    public void removePrefixFromNetData_routeIsRemovedFromTunInterface() throws Exception {
-        ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
-        mController.joinAndWait(DEFAULT_DATASET);
-        mOtCtl.executeCommand("prefix add " + TEST_NO_SLAAC_PREFIX + " pros med");
-        mOtCtl.executeCommand("netdata register");
-
-        mOtCtl.executeCommand("prefix remove " + TEST_NO_SLAAC_PREFIX);
-        mOtCtl.executeCommand("netdata register");
-        waitFor(
-                () -> {
-                    String netData = mOtCtl.executeCommand("netdata show");
-                    return !getPrefixesFromNetData(netData).contains(TEST_NO_SLAAC_PREFIX);
-                },
-                NET_DATA_UPDATE_TIMEOUT);
-
-        LinkProperties lp = cm.getLinkProperties(getThreadNetwork(CALLBACK_TIMEOUT));
-        assertThat(lp).isNotNull();
-        assertThat(lp.getRoutes().stream().anyMatch(r -> r.matches(TEST_NO_SLAAC_PREFIX_ADDRESS)))
-                .isFalse();
-    }
-
-    @Test
-    public void toggleThreadNetwork_routeFromPreviousNetDataIsRemoved() throws Exception {
-        ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
-        mController.joinAndWait(DEFAULT_DATASET);
-        mOtCtl.executeCommand("prefix add " + TEST_NO_SLAAC_PREFIX + " pros med");
-        mOtCtl.executeCommand("netdata register");
-
-        mController.leaveAndWait();
-        mOtCtl.factoryReset();
-        mController.joinAndWait(DEFAULT_DATASET);
-
-        LinkProperties lp = cm.getLinkProperties(getThreadNetwork(CALLBACK_TIMEOUT));
-        assertThat(lp).isNotNull();
-        assertThat(lp.getRoutes().stream().anyMatch(r -> r.matches(TEST_NO_SLAAC_PREFIX_ADDRESS)))
-                .isFalse();
-    }
-
-    @Test
-    public void setConfiguration_disableBorderRouter_noBrfunctionsEnabled() throws Exception {
-        NetworkRequest request =
-                new NetworkRequest.Builder()
-                        .addTransportType(NetworkCapabilities.TRANSPORT_THREAD)
-                        .build();
+    @RequiresSimulationThreadDevice
+    public void setConfiguration_disableBorderRouter_borderRoutingDisabled() throws Exception {
         startFtdLeader(mFtd, DEFAULT_DATASET);
 
         mController.setConfigurationAndWait(
                 new ThreadConfiguration.Builder().setBorderRouterEnabled(false).build());
         mController.joinAndWait(DEFAULT_DATASET);
-        NetworkCapabilities caps = registerNetworkCallbackAndWait(request);
 
-        assertThat(caps.hasCapability(NET_CAPABILITY_LOCAL_NETWORK)).isFalse();
         assertThat(mOtCtl.getBorderRoutingState()).ignoringCase().isEqualTo("disabled");
-        assertThat(mOtCtl.getSrpServerState()).ignoringCase().isNotEqualTo("disabled");
         // TODO: b/376217403 - enables / disables Border Agent at runtime
+    }
+
+    @Test
+    public void networkDiagnostic_vendorAndModelNameAreSet() throws Exception {
+        mController.joinAndWait(DEFAULT_DATASET);
+
+        var tlvTypes = List.of(DIAG_VENDOR_NAME_TLV_TYPE, DIAG_VENDOR_MODEL_TLV_TYPE);
+        var result = mOtCtl.netDiagGet(mOtCtl.getMlEid(), tlvTypes);
+
+        assertThat(result.get("Vendor Name")).isNotEmpty();
+        assertThat(result.get("Vendor Model")).isNotEmpty();
     }
 
     private NetworkCapabilities registerNetworkCallbackAndWait(NetworkRequest request)
@@ -440,9 +372,5 @@ public class ThreadIntegrationTest {
         } catch (IOException e) {
             throw new IllegalStateException(e);
         }
-    }
-
-    private void assertTunInterfaceMemberOfGroup(Inet6Address address) throws Exception {
-        waitFor(() -> isInMulticastGroup(TUN_IF_NAME, address), TUN_ADDR_UPDATE_TIMEOUT);
     }
 }

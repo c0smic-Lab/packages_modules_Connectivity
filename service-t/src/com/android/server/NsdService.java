@@ -23,6 +23,7 @@ import static android.net.ConnectivityManager.NETID_UNSET;
 import static android.net.NetworkCapabilities.TRANSPORT_VPN;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
 import static android.net.NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK;
+import static android.net.nsd.AdvertisingRequest.FLAG_SKIP_PROBING;
 import static android.net.nsd.NsdManager.MDNS_DISCOVERY_MANAGER_EVENT;
 import static android.net.nsd.NsdManager.MDNS_SERVICE_EVENT;
 import static android.net.nsd.NsdManager.RESOLVE_SERVICE_SUCCEEDED;
@@ -981,7 +982,7 @@ public class NsdService extends INsdManager.Stub {
                                         NsdManager.FAILURE_INTERNAL_ERROR, false /* isLegacy */);
                                 break;
                             }
-                            boolean isUpdateOnly = (advertisingRequest.getAdvertisingConfig()
+                            boolean isUpdateOnly = (advertisingRequest.getFlags()
                                     & AdvertisingRequest.NSD_ADVERTISING_UPDATE_ONLY) > 0;
                             // If it is an update request, then reuse the old transactionId
                             if (isUpdateOnly) {
@@ -1046,9 +1047,12 @@ public class NsdService extends INsdManager.Stub {
 
                             serviceInfo.setSubtypes(subtypes);
                             maybeStartMonitoringSockets();
+                            final boolean skipProbing = (advertisingRequest.getFlags()
+                                    & FLAG_SKIP_PROBING) > 0;
                             final MdnsAdvertisingOptions mdnsAdvertisingOptions =
                                     MdnsAdvertisingOptions.newBuilder()
                                             .setIsOnlyUpdate(isUpdateOnly)
+                                            .setSkipProbing(skipProbing)
                                             .setTtl(advertisingRequest.getTtl())
                                             .build();
                             mAdvertiser.addOrUpdateService(transactionId, serviceInfo,
@@ -1938,11 +1942,13 @@ public class NsdService extends INsdManager.Stub {
                         mContext, MdnsFeatureFlags.NSD_QUERY_WITH_KNOWN_ANSWER))
                 .setAvoidAdvertisingEmptyTxtRecords(mDeps.isTetheringFeatureNotChickenedOut(
                         mContext, MdnsFeatureFlags.NSD_AVOID_ADVERTISING_EMPTY_TXT_RECORDS))
-                .setIsCachedServicesRemovalEnabled(mDeps.isFeatureEnabled(
+                .setIsCachedServicesRemovalEnabled(mDeps.isTetheringFeatureNotChickenedOut(
                         mContext, MdnsFeatureFlags.NSD_CACHED_SERVICES_REMOVAL))
                 .setCachedServicesRetentionTime(mDeps.getDeviceConfigPropertyInt(
                         MdnsFeatureFlags.NSD_CACHED_SERVICES_RETENTION_TIME,
                         MdnsFeatureFlags.DEFAULT_CACHED_SERVICES_RETENTION_TIME_MILLISECONDS))
+                .setIsShortHostnamesEnabled(mDeps.isTetheringFeatureNotChickenedOut(
+                        mContext, MdnsFeatureFlags.NSD_USE_SHORT_HOSTNAMES))
                 .setOverrideProvider(new MdnsFeatureFlags.FlagOverrideProvider() {
                     @Override
                     public boolean isForceEnabledForTest(@NonNull String flag) {

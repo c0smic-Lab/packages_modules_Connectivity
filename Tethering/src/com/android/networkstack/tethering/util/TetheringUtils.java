@@ -15,7 +15,23 @@
  */
 package com.android.networkstack.tethering.util;
 
+import static android.net.NetworkCapabilities.TRANSPORT_BLUETOOTH;
+import static android.net.NetworkCapabilities.TRANSPORT_ETHERNET;
+import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
+import static android.net.NetworkCapabilities.TRANSPORT_USB;
+import static android.net.TetheringManager.CONNECTIVITY_SCOPE_GLOBAL;
+import static android.net.TetheringManager.CONNECTIVITY_SCOPE_LOCAL;
+import static android.net.TetheringManager.TETHERING_BLUETOOTH;
+import static android.net.TetheringManager.TETHERING_ETHERNET;
+import static android.net.TetheringManager.TETHERING_NCM;
+import static android.net.TetheringManager.TETHERING_USB;
+import static android.net.TetheringManager.TETHERING_VIRTUAL;
+import static android.net.TetheringManager.TETHERING_WIFI;
+import static android.net.TetheringManager.TETHERING_WIFI_P2P;
+import static android.net.TetheringManager.TETHERING_WIGIG;
+
 import android.net.TetherStatsParcel;
+import android.net.TetheringManager.TetheringRequest;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -164,6 +180,69 @@ public class TetheringUtils {
             Log.wtf("TetheringUtils", "Failed to construct Inet6Address from "
                     + Arrays.toString(ALL_NODES) + " and scopedId " + scopeId);
             return null;
+        }
+    }
+
+    /**
+     * Create a legacy tethering request for calls to the legacy tether() API, which doesn't take an
+     * explicit request. These are always CONNECTIVITY_SCOPE_GLOBAL, per historical behavior.
+     */
+    @NonNull
+    public static TetheringRequest createLegacyGlobalScopeTetheringRequest(int type) {
+        final TetheringRequest request = new TetheringRequest.Builder(type).build();
+        request.getParcel().requestType = TetheringRequest.REQUEST_TYPE_LEGACY;
+        request.getParcel().connectivityScope = CONNECTIVITY_SCOPE_GLOBAL;
+        return request;
+    }
+
+    /**
+     * Create a local-only implicit tethering request. This is used for Wifi local-only hotspot and
+     * Wifi P2P, which start tethering based on the WIFI_(AP/P2P)_STATE_CHANGED broadcasts.
+     */
+    @NonNull
+    public static TetheringRequest createImplicitLocalOnlyTetheringRequest(int type) {
+        final TetheringRequest request = new TetheringRequest.Builder(type).build();
+        request.getParcel().requestType = TetheringRequest.REQUEST_TYPE_IMPLICIT;
+        request.getParcel().connectivityScope = CONNECTIVITY_SCOPE_LOCAL;
+        return request;
+    }
+
+    /**
+     * Create a placeholder request. This is used in case we try to find a pending request but there
+     * is none (e.g. stopTethering removed a pending request), or for cases where we only have the
+     * tethering type (e.g. stopTethering(int)).
+     */
+    @NonNull
+    public static TetheringRequest createPlaceholderRequest(int type) {
+        final TetheringRequest request = new TetheringRequest.Builder(type).build();
+        request.getParcel().requestType = TetheringRequest.REQUEST_TYPE_PLACEHOLDER;
+        request.getParcel().connectivityScope = CONNECTIVITY_SCOPE_GLOBAL;
+        return request;
+    }
+
+    /**
+     * Returns the transport type for the given interface type.
+     *
+     * @param interfaceType The interface type.
+     * @return The transport type.
+     * @throws IllegalArgumentException if the interface type is invalid.
+     */
+    public static int getTransportTypeForTetherableType(int interfaceType) {
+        switch (interfaceType) {
+            case TETHERING_WIFI:
+            case TETHERING_WIGIG:
+            case TETHERING_WIFI_P2P:
+                return TRANSPORT_WIFI;
+            case TETHERING_USB:
+            case TETHERING_NCM:
+                return TRANSPORT_USB;
+            case TETHERING_BLUETOOTH:
+                return TRANSPORT_BLUETOOTH;
+            case TETHERING_ETHERNET:
+            case TETHERING_VIRTUAL: // For virtual machines.
+                return TRANSPORT_ETHERNET;
+            default:
+                throw new IllegalArgumentException("Invalid interface type: " + interfaceType);
         }
     }
 }

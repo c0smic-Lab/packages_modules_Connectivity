@@ -16,6 +16,7 @@
 package android.net.connectivity;
 
 import android.compat.annotation.ChangeId;
+import android.compat.annotation.Disabled;
 import android.compat.annotation.EnabledAfter;
 import android.compat.annotation.EnabledSince;
 import android.os.Build;
@@ -100,9 +101,9 @@ public final class ConnectivityCompatChanges {
     public static final long ENABLE_MATCH_LOCAL_NETWORK = 319212206L;
 
     /**
-     * On Android {@link android.os.Build.VERSION_CODES.VANILLA_ICE_CREAM} or higher releases,
-     * network access from apps targeting Android 36 or higher that do not have the
-     * {@link android.Manifest.permission#INTERNET} permission is considered blocked.
+     * On Android versions starting from 37, network access from apps targeting
+     * Android 37 or higher, that do not have the {@link android.Manifest.permission#INTERNET}
+     * permission, is considered blocked.
      * This results in API behaviors change for apps without
      * {@link android.Manifest.permission#INTERNET} permission.
      * {@link android.net.NetworkInfo} returned from {@link android.net.ConnectivityManager} APIs
@@ -115,10 +116,12 @@ public final class ConnectivityCompatChanges {
      * network access from apps without {@link android.Manifest.permission#INTERNET} permission is
      * considered not blocked even though apps cannot access any networks.
      *
+     * TODO: b/400903101 - Update the target SDK version once it's finalized.
+     *
      * @hide
      */
     @ChangeId
-    @EnabledAfter(targetSdkVersion = Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    @EnabledAfter(targetSdkVersion = 36)
     public static final long NETWORK_BLOCKED_WITHOUT_INTERNET_PERMISSION = 333340911L;
 
     /**
@@ -134,6 +137,28 @@ public final class ConnectivityCompatChanges {
     @ChangeId
     @EnabledAfter(targetSdkVersion = Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public static final long ENABLE_TRAFFICSTATS_RATE_LIMIT_CACHE = 74210811L;
+
+    /**
+     * Restrict local network access.
+     * Apps targeting a release after V will require permissions to access the local network.
+     *
+     * ToDo: Update the target SDK version once it's finalized.
+     * @hide
+     */
+    @ChangeId
+    @Disabled
+    public static final long RESTRICT_LOCAL_NETWORK = 365139289L;
+
+    /**
+     * Enable match non-threads local networks.
+     *
+     * Apps targeting a release after V can have NetworkRequests matches non-thread local networks.
+     *
+     * @hide
+     */
+    @ChangeId
+    @EnabledAfter(targetSdkVersion = Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public static final long ENABLE_MATCH_NON_THREAD_LOCAL_NETWORKS = 349487600L;
 
     private ConnectivityCompatChanges() {
     }

@@ -22,6 +22,7 @@ import static android.Manifest.permission.NETWORK_SETTINGS;
 import static android.Manifest.permission.TETHER_PRIVILEGED;
 import static android.net.TetheringManager.TETHERING_WIFI;
 import static android.net.TetheringManager.TETHER_ERROR_NO_ERROR;
+import static android.net.TetheringManager.TETHER_ERROR_UNKNOWN_REQUEST;
 import static android.net.TetheringManager.TETHER_HARDWARE_OFFLOAD_FAILED;
 import static android.net.TetheringManager.TETHER_HARDWARE_OFFLOAD_STARTED;
 import static android.net.TetheringManager.TETHER_HARDWARE_OFFLOAD_STOPPED;
@@ -118,11 +119,79 @@ public final class CtsTetheringUtils {
                     cv instanceof CallbackValue.OnTetheringStarted);
         }
 
-        public void expectTetheringFailed(final int expected) throws InterruptedException {
+        /**
+         * Verify that starting tethering failed with the specified error code.
+         */
+        public void expectTetheringFailed(final int expected) {
             final CallbackValue cv = mHistory.poll(TIMEOUT_MS, c -> true);
             assertNotNull("No onTetheringFailed after " + TIMEOUT_MS + " ms", cv);
             assertTrue("Expect fail with error code " + expected + ", but received: " + cv,
                     (cv instanceof CallbackValue.OnTetheringFailed) && (cv.error == expected));
+        }
+    }
+
+    public static class StopTetheringCallback implements TetheringManager.StopTetheringCallback {
+        private static final int TIMEOUT_MS = 30_000;
+        public static class CallbackValue {
+            public final int error;
+
+            private CallbackValue(final int e) {
+                error = e;
+            }
+
+            public static class OnStopTetheringSucceeded extends CallbackValue {
+                OnStopTetheringSucceeded() {
+                    super(TETHER_ERROR_NO_ERROR);
+                }
+            }
+
+            public static class OnStopTetheringFailed extends CallbackValue {
+                OnStopTetheringFailed(final int error) {
+                    super(error);
+                }
+            }
+
+            @Override
+            public String toString() {
+                return String.format("%s(%d)", getClass().getSimpleName(), error);
+            }
+        }
+
+        private final ArrayTrackRecord<CallbackValue>.ReadHead mHistory =
+                new ArrayTrackRecord<CallbackValue>().newReadHead();
+
+        @Override
+        public void onStopTetheringSucceeded() {
+            mHistory.add(new CallbackValue.OnStopTetheringSucceeded());
+            // Call the parent method so that the coverage linter sees it: http://b/385014495
+            TetheringManager.StopTetheringCallback.super.onStopTetheringSucceeded();
+        }
+
+        @Override
+        public void onStopTetheringFailed(final int error) {
+            mHistory.add(new CallbackValue.OnStopTetheringFailed(error));
+            // Call the parent method so that the coverage linter sees it: http://b/385014495
+            TetheringManager.StopTetheringCallback.super.onStopTetheringFailed(error);
+        }
+
+        /**
+         *  Verifies that {@link #onStopTetheringSucceeded()} was called
+         */
+        public void verifyStopTetheringSucceeded() {
+            final CallbackValue cv = mHistory.poll(TIMEOUT_MS, c -> true);
+            assertNotNull("No onStopTetheringSucceeded after " + TIMEOUT_MS + " ms", cv);
+            assertTrue("Fail stop tethering:" + cv,
+                    cv instanceof CallbackValue.OnStopTetheringSucceeded);
+        }
+
+        /**
+         *  Verifies that {@link #onStopTetheringFailed(int)} was called
+         */
+        public void expectStopTetheringFailed(final int expected) {
+            final CallbackValue cv = mHistory.poll(TIMEOUT_MS, c -> true);
+            assertNotNull("No onStopTetheringFailed after " + TIMEOUT_MS + " ms", cv);
+            assertTrue("Expect fail with error code " + expected + ", but received: " + cv,
+                    (cv instanceof CallbackValue.OnStopTetheringFailed) && (cv.error == expected));
         }
     }
 
@@ -493,19 +562,28 @@ public final class CtsTetheringUtils {
     }
 
     /**
-     * Starts Wi-Fi tethering.
+     * Starts Wi-Fi tethering with TETHER_PRIVILEGED permission.
      */
-    public TetheringInterface startWifiTethering(final TestTetheringEventCallback callback)
-            throws InterruptedException {
+    public TetheringInterface startWifiTethering(final TestTetheringEventCallback callback) {
         return startWifiTethering(callback, null);
     }
 
     /**
-     * Starts Wi-Fi tethering with the specified SoftApConfiguration.
+     * Starts Wi-Fi tethering with TETHER_PRIVILEGED permission and the specified
+     * SoftApConfiguration.
      */
     public TetheringInterface startWifiTethering(final TestTetheringEventCallback callback,
-            final SoftApConfiguration softApConfiguration)
-            throws InterruptedException {
+            final SoftApConfiguration softApConfiguration) {
+        return runAsShell(TETHER_PRIVILEGED, () -> startWifiTetheringNoPermissions(
+                callback, softApConfiguration));
+    }
+
+    /**
+     * Starts Wi-Fi tethering without any permission with the specified SoftApConfiguration.
+     */
+    public TetheringInterface startWifiTetheringNoPermissions(
+            final TestTetheringEventCallback callback,
+            final SoftApConfiguration softApConfiguration) {
         final List<String> wifiRegexs = getWifiTetherableInterfaceRegexps(callback);
 
         final StartTetheringCallback startTetheringCallback = new StartTetheringCallback();
@@ -516,19 +594,17 @@ public final class CtsTetheringUtils {
         }
         final TetheringRequest request = builder.build();
 
-        return runAsShell(TETHER_PRIVILEGED, () -> {
-            mTm.startTethering(request, c -> c.run() /* executor */, startTetheringCallback);
-            startTetheringCallback.verifyTetheringStarted();
+        mTm.startTethering(request, c -> c.run() /* executor */, startTetheringCallback);
+        startTetheringCallback.verifyTetheringStarted();
 
-            final TetheringInterface iface =
-                    callback.expectTetheredInterfacesChanged(wifiRegexs, TETHERING_WIFI);
+        final TetheringInterface iface =
+                callback.expectTetheredInterfacesChanged(wifiRegexs, TETHERING_WIFI);
 
-            callback.expectOneOfOffloadStatusChanged(
-                    TETHER_HARDWARE_OFFLOAD_STARTED,
-                    TETHER_HARDWARE_OFFLOAD_FAILED);
+        callback.expectOneOfOffloadStatusChanged(
+                TETHER_HARDWARE_OFFLOAD_STARTED,
+                TETHER_HARDWARE_OFFLOAD_FAILED);
 
-            return iface;
-        });
+        return iface;
     }
 
     private static class StopSoftApCallback implements SoftApCallback {
@@ -572,6 +648,22 @@ public final class CtsTetheringUtils {
             callback.expectOneOfOffloadStatusChanged(TETHER_HARDWARE_OFFLOAD_STOPPED);
         });
         expectSoftApDisabled();
+    }
+
+    /**
+     * Calls {@link TetheringManager#stopTethering(TetheringRequest, Executor,
+     * TetheringManager.StopTetheringCallback)} and verifies if it succeeded or failed.
+     */
+    public void stopTethering(final TetheringRequest request, boolean expectSuccess) {
+        final StopTetheringCallback stopTetheringCallback = new StopTetheringCallback();
+        runAsShell(TETHER_PRIVILEGED, () -> {
+            mTm.stopTethering(request, c -> c.run() /* executor */, stopTetheringCallback);
+            if (expectSuccess) {
+                stopTetheringCallback.verifyStopTetheringSucceeded();
+            } else {
+                stopTetheringCallback.expectStopTetheringFailed(TETHER_ERROR_UNKNOWN_REQUEST);
+            }
+        });
     }
 
     public void stopAllTethering() {

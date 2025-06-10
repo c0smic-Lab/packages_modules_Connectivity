@@ -44,6 +44,7 @@ import android.net.NetworkRequest
 import android.net.RouteInfo
 import android.net.TestNetworkInterface
 import android.net.TestNetworkManager
+import android.net.TestNetworkManager.TestInterfaceRequest
 import android.net.cts.util.CtsNetUtils.TestNetworkCallback
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -164,7 +165,11 @@ class DscpPolicyTest {
 
             // Only statically configure the IPv4 address; for IPv6, use the SLAAC generated
             // address.
-            iface = tnm.createTapInterface(arrayOf(LinkAddress(LOCAL_IPV4_ADDRESS, IP4_PREFIX_LEN)))
+            val req = TestInterfaceRequest.Builder()
+                    .setTap()
+                    .addLinkAddress(LinkAddress(LOCAL_IPV4_ADDRESS, IP4_PREFIX_LEN))
+                    .build()
+            iface = tnm.createTestInterface(req)
             assertNotNull(iface)
         }
 
@@ -751,6 +756,27 @@ class DscpPolicyTest {
         assertEquals(srcPort, policy2.sourcePort)
         assertEquals(IPPROTO_UDP, policy2.protocol)
         assertParcelingIsLossless(policy2)
+    }
+
+    @Test
+    fun testSendDscpPolicyWithoutInterfaceName() {
+        val nc = NetworkCapabilities().apply {
+            addTransportType(TRANSPORT_TEST)
+        }
+        val agent = TestableNetworkAgent(
+                realContext,
+                handlerThread.looper,
+                nc,
+                LinkProperties() /* note: no interface name */,
+                NetworkAgentConfig.Builder().build()
+        )
+        agentsToCleanUp.add(agent)
+        runAsShell(MANAGE_TEST_NETWORKS) { agent.register() }
+        // Without the fix, this will crash the system with SIGSEGV.
+        agent.sendAddDscpPolicy(DscpPolicy.Builder(1, 1).build())
+        // Will receive OnNetworkCreated first if the agent is created early. To avoid reading
+        // the flag here, use eventuallyExpect.
+        agent.eventuallyExpect<OnDscpPolicyStatusUpdated>()
     }
 }
 

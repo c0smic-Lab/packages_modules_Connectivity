@@ -16,17 +16,23 @@
 
 package com.android.cts.net.hostside;
 
+import static android.net.TetheringManager.TETHERING_WIFI;
+
 import static androidx.test.platform.app.InstrumentationRegistry.getInstrumentation;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assume.assumeTrue;
 
 import android.content.Context;
 import android.net.TetheringInterface;
 import android.net.cts.util.CtsTetheringUtils;
+import android.net.cts.util.CtsTetheringUtils.TestTetheringEventCallback;
 import android.net.wifi.SoftApConfiguration;
 import android.net.wifi.WifiSsid;
+
+import com.android.modules.utils.build.SdkLevel;
 
 import org.junit.After;
 import org.junit.Before;
@@ -37,6 +43,7 @@ import java.nio.charset.StandardCharsets;
 public class TetheringTest {
     private CtsTetheringUtils mCtsTetheringUtils;
     private TetheringHelperClient mTetheringHelperClient;
+    private TestTetheringEventCallback mTetheringEventCallback;
 
     @Before
     public void setUp() throws Exception {
@@ -44,11 +51,14 @@ public class TetheringTest {
         mCtsTetheringUtils = new CtsTetheringUtils(targetContext);
         mTetheringHelperClient = new TetheringHelperClient(targetContext);
         mTetheringHelperClient.bind();
+        mTetheringEventCallback = mCtsTetheringUtils.registerTetheringEventCallback();
     }
 
     @After
     public void tearDown() throws Exception {
         mTetheringHelperClient.unbind();
+        mCtsTetheringUtils.unregisterTetheringEventCallback(mTetheringEventCallback);
+        mCtsTetheringUtils.stopAllTethering();
     }
 
     /**
@@ -57,24 +67,25 @@ public class TetheringTest {
      */
     @Test
     public void testSoftApConfigurationRedactedForOtherUids() throws Exception {
-        final CtsTetheringUtils.TestTetheringEventCallback tetherEventCallback =
-                mCtsTetheringUtils.registerTetheringEventCallback();
+        assumeTrue(SdkLevel.isAtLeastB());
+
+        mTetheringEventCallback.assumeWifiTetheringSupported(
+                getInstrumentation().getTargetContext());
         SoftApConfiguration softApConfig = new SoftApConfiguration.Builder()
                 .setWifiSsid(WifiSsid.fromBytes("This is an SSID!"
                         .getBytes(StandardCharsets.UTF_8))).build();
         final TetheringInterface tetheringInterface =
-                mCtsTetheringUtils.startWifiTethering(tetherEventCallback, softApConfig);
+                mCtsTetheringUtils.startWifiTethering(mTetheringEventCallback, softApConfig);
         assertNotNull(tetheringInterface);
         assertEquals(softApConfig, tetheringInterface.getSoftApConfiguration());
-        try {
-            TetheringInterface tetheringInterfaceForApp2 =
-                    mTetheringHelperClient.getTetheredWifiInterface();
-            assertNotNull(tetheringInterfaceForApp2);
-            assertNull(tetheringInterfaceForApp2.getSoftApConfiguration());
-            assertEquals(
-                    tetheringInterface.getInterface(), tetheringInterfaceForApp2.getInterface());
-        } finally {
-            mCtsTetheringUtils.stopWifiTethering(tetherEventCallback);
-        }
+        assertEquals(new TetheringInterface(
+                TETHERING_WIFI, tetheringInterface.getInterface(), softApConfig),
+                tetheringInterface);
+        TetheringInterface tetheringInterfaceForApp2 =
+                mTetheringHelperClient.getTetheredWifiInterface();
+        assertNotNull(tetheringInterfaceForApp2);
+        assertNull(tetheringInterfaceForApp2.getSoftApConfiguration());
+        assertEquals(
+                tetheringInterface.getInterface(), tetheringInterfaceForApp2.getInterface());
     }
 }

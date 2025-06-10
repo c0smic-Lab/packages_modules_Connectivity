@@ -21,6 +21,7 @@ import static android.net.NetworkRequest.Type.BACKGROUND_REQUEST;
 import static android.net.NetworkRequest.Type.LISTEN;
 import static android.net.NetworkRequest.Type.LISTEN_FOR_BEST;
 import static android.net.NetworkRequest.Type.REQUEST;
+import static android.net.NetworkRequest.Type.RESERVATION;
 import static android.net.NetworkRequest.Type.TRACK_DEFAULT;
 import static android.net.NetworkRequest.Type.TRACK_SYSTEM_DEFAULT;
 import static android.net.QosCallback.QosCallbackRegistrationException;
@@ -1199,11 +1200,14 @@ public class ConnectivityManager {
 
     /** @hide */
     public static final long FEATURE_USE_DECLARED_METHODS_FOR_CALLBACKS = 1L;
+    /** @hide */
+    public static final long FEATURE_QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER = 1L << 1;
 
     /** @hide */
     @Retention(RetentionPolicy.SOURCE)
     @LongDef(flag = true, prefix = "FEATURE_", value = {
-            FEATURE_USE_DECLARED_METHODS_FOR_CALLBACKS
+            FEATURE_USE_DECLARED_METHODS_FOR_CALLBACKS,
+            FEATURE_QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER
     })
     public @interface ConnectivityManagerFeature {}
 
@@ -1240,6 +1244,26 @@ public class ConnectivityManager {
     @GuardedBy("sEnabledConnectivityManagerFeaturesLock")
     @ConnectivityManagerFeature
     private Long mEnabledConnectivityManagerFeatures = null;
+
+    /**
+     * A class to help with mocking ConnectivityManager.
+     * @hide
+     */
+    public static class MockHelpers {
+        /**
+         * Produce an instance of the class returned by
+         * {@link ConnectivityManager#registerNetworkAgent}
+         * @hide
+         */
+        public static NetworkAndAgentRegistryParcelable registerNetworkAgentResult(
+                @Nullable final Network network, @Nullable final INetworkAgentRegistry registry) {
+            final NetworkAndAgentRegistryParcelable result =
+                    new NetworkAndAgentRegistryParcelable();
+            result.network = network;
+            result.registry = registry;
+            return result;
+        }
+    }
 
     private TetheringManager getTetheringManager() {
         synchronized (mTetheringEventCallbacks) {
@@ -1873,7 +1897,7 @@ public class ConnectivityManager {
     public NetworkCapabilities[] getDefaultNetworkCapabilitiesForUser(int userId) {
         try {
             return mService.getDefaultNetworkCapabilitiesForUser(
-                    userId, mContext.getOpPackageName(), getAttributionTag());
+                    userId, mContext.getOpPackageName(), mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -1967,7 +1991,7 @@ public class ConnectivityManager {
             @NonNull String packageName) {
         try {
             return mService.getRedactedLinkPropertiesForPackage(
-                    lp, uid, packageName, getAttributionTag());
+                    lp, uid, packageName, mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -1993,7 +2017,7 @@ public class ConnectivityManager {
     public NetworkCapabilities getNetworkCapabilities(@Nullable Network network) {
         try {
             return mService.getNetworkCapabilities(
-                    network, mContext.getOpPackageName(), getAttributionTag());
+                    network, mContext.getOpPackageName(), mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -2027,7 +2051,7 @@ public class ConnectivityManager {
             int uid, @NonNull String packageName) {
         try {
             return mService.getRedactedNetworkCapabilitiesForPackage(nc, uid, packageName,
-                    getAttributionTag());
+                    mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
@@ -2752,18 +2776,10 @@ public class ConnectivityManager {
         checkLegacyRoutingApiAccess();
         try {
             return mService.requestRouteToHostAddress(networkType, hostAddress.getAddress(),
-                    mContext.getOpPackageName(), getAttributionTag());
+                    mContext.getOpPackageName(), mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         }
-    }
-
-    /**
-     * @return the context's attribution tag
-     */
-    // TODO: Remove method and replace with direct call once R code is pushed to AOSP
-    private @Nullable String getAttributionTag() {
-        return mContext.getAttributionTag();
     }
 
     /**
@@ -3072,7 +3088,8 @@ public class ConnectivityManager {
      * <p>WARNING: New clients should not use this function. The only usages should be in PanService
      * and WifiStateMachine which need direct access. All other clients should use
      * {@link #startTethering} and {@link #stopTethering} which encapsulate proper provisioning
-     * logic.</p>
+     * logic. On SDK versions after {@link Build.VERSION_CODES.VANILLA_ICE_CREAM}, this will throw
+     * an UnsupportedOperationException.</p>
      *
      * @param iface the interface name to tether.
      * @return error a {@code TETHER_ERROR} value indicating success or failure type
@@ -3097,7 +3114,8 @@ public class ConnectivityManager {
      * <p>WARNING: New clients should not use this function. The only usages should be in PanService
      * and WifiStateMachine which need direct access. All other clients should use
      * {@link #startTethering} and {@link #stopTethering} which encapsulate proper provisioning
-     * logic.</p>
+     * logic. On SDK versions after {@link Build.VERSION_CODES.VANILLA_ICE_CREAM}, this will throw
+     * an UnsupportedOperationException.</p>
      *
      * @param iface the interface name to untether.
      * @return error a {@code TETHER_ERROR} value indicating success or failure type
@@ -3957,7 +3975,8 @@ public class ConnectivityManager {
     @RequiresPermission(anyOf = {
             NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK,
             android.Manifest.permission.NETWORK_FACTORY})
-    public Network registerNetworkAgent(@NonNull INetworkAgent na, @NonNull NetworkInfo ni,
+    public NetworkAndAgentRegistryParcelable registerNetworkAgent(
+            @NonNull INetworkAgent na, @NonNull NetworkInfo ni,
             @NonNull LinkProperties lp, @NonNull NetworkCapabilities nc,
             @NonNull NetworkScore score, @NonNull NetworkAgentConfig config, int providerId) {
         return registerNetworkAgent(na, ni, lp, nc, null /* localNetworkConfig */, score, config,
@@ -3972,7 +3991,8 @@ public class ConnectivityManager {
     @RequiresPermission(anyOf = {
             NetworkStack.PERMISSION_MAINLINE_NETWORK_STACK,
             android.Manifest.permission.NETWORK_FACTORY})
-    public Network registerNetworkAgent(@NonNull INetworkAgent na, @NonNull NetworkInfo ni,
+    public NetworkAndAgentRegistryParcelable registerNetworkAgent(
+            @NonNull INetworkAgent na, @NonNull NetworkInfo ni,
             @NonNull LinkProperties lp, @NonNull NetworkCapabilities nc,
             @Nullable LocalNetworkConfig localNetworkConfig, @NonNull NetworkScore score,
             @NonNull NetworkAgentConfig config, int providerId) {
@@ -4279,12 +4299,18 @@ public class ConnectivityManager {
         private static final int METHOD_ONLOST = 6;
 
         /**
-         * Called if no network is found within the timeout time specified in
-         * {@link #requestNetwork(NetworkRequest, NetworkCallback, int)} call or if the
-         * requested network request cannot be fulfilled (whether or not a timeout was
-         * specified). When this callback is invoked the associated
-         * {@link NetworkRequest} will have already been removed and released, as if
-         * {@link #unregisterNetworkCallback(NetworkCallback)} had been called.
+         * If the callback was registered with one of the {@code requestNetwork} methods, this will
+         * be called if no network is found within the timeout specified in {@link
+         * #requestNetwork(NetworkRequest, NetworkCallback, int)} call or if the requested network
+         * request cannot be fulfilled (whether or not a timeout was specified).
+         *
+         * If the callback was registered when reserving a network, this method indicates that the
+         * reservation is removed. It can be called when the reservation is requested, because the
+         * system could not satisfy the reservation, or after the reserved network connects.
+         *
+         * When this callback is invoked the associated {@link NetworkRequest} will have already
+         * been removed and released, as if {@link #unregisterNetworkCallback(NetworkCallback)} had
+         * been called.
          */
         @FilteredCallback(methodId = METHOD_ONUNAVAILABLE, calledByCallbackId = CALLBACK_UNAVAIL)
         public void onUnavailable() {}
@@ -4425,6 +4451,28 @@ public class ConnectivityManager {
         }
         private static final int METHOD_ONBLOCKEDSTATUSCHANGED_INT = 14;
 
+        /**
+         * Called when a network is reserved.
+         *
+         * The reservation includes the {@link NetworkCapabilities} that uniquely describe the
+         * network that was reserved. the caller communicates this information to hardware or
+         * software components on or off-device to instruct them to create a network matching this
+         * reservation.
+         *
+         * {@link #onReserved(NetworkCapabilities)} is called at most once and is guaranteed to be
+         * called before any other callback unless the reservation is unavailable.
+         *
+         * Once a reservation is made, the reserved {@link NetworkCapabilities} will not be updated,
+         * and the reservation remains in place until the reserved network connects or {@link
+         * #onUnavailable} is called.
+         *
+         * @param networkCapabilities The {@link NetworkCapabilities} of the reservation.
+         */
+        @FlaggedApi(Flags.FLAG_IPV6_OVER_BLE)
+        @FilteredCallback(methodId = METHOD_ONRESERVED, calledByCallbackId = CALLBACK_RESERVED)
+        public void onReserved(@NonNull NetworkCapabilities networkCapabilities) {}
+        private static final int METHOD_ONRESERVED = 15;
+
         private NetworkRequest networkRequest;
         private final int mFlags;
     }
@@ -4476,6 +4524,8 @@ public class ConnectivityManager {
     public static final int CALLBACK_BLK_CHANGED                = 11;
     /** @hide */
     public static final int CALLBACK_LOCAL_NETWORK_INFO_CHANGED = 12;
+    /** @hide */
+    public static final int CALLBACK_RESERVED                   = 13;
     // When adding new IDs, note CallbackQueue assumes callback IDs are at most 16 bits.
 
 
@@ -4495,6 +4545,7 @@ public class ConnectivityManager {
             case CALLBACK_RESUMED:      return "CALLBACK_RESUMED";
             case CALLBACK_BLK_CHANGED:  return "CALLBACK_BLK_CHANGED";
             case CALLBACK_LOCAL_NETWORK_INFO_CHANGED: return "CALLBACK_LOCAL_NETWORK_INFO_CHANGED";
+            case CALLBACK_RESERVED:     return "CALLBACK_RESERVED";
             default:
                 return Integer.toString(whichCallback);
         }
@@ -4525,6 +4576,7 @@ public class ConnectivityManager {
     public static class NetworkCallbackMethodsHolder {
         public static final NetworkCallbackMethod[] NETWORK_CB_METHODS =
                 new NetworkCallbackMethod[] {
+                        method("onReserved", 1 << CALLBACK_RESERVED, NetworkCapabilities.class),
                         method("onPreCheck", 1 << CALLBACK_PRECHECK, Network.class),
                         // Note the final overload of onAvailable is not included, since it cannot
                         // match any overridden method.
@@ -4604,6 +4656,11 @@ public class ConnectivityManager {
             }
 
             switch (message.what) {
+                case CALLBACK_RESERVED: {
+                    final NetworkCapabilities cap = getObject(message, NetworkCapabilities.class);
+                    callback.onReserved(cap);
+                    break;
+                }
                 case CALLBACK_PRECHECK: {
                     callback.onPreCheck(network);
                     break;
@@ -4705,12 +4762,12 @@ public class ConnectivityManager {
                 if (reqType == LISTEN) {
                     request = mService.listenForNetwork(
                             need, messenger, binder, callbackFlags, callingPackageName,
-                            getAttributionTag(), declaredMethodsFlag);
+                            mContext.getAttributionTag(), declaredMethodsFlag);
                 } else {
                     request = mService.requestNetwork(
                             asUid, need, reqType.ordinal(), messenger, timeoutMs, binder,
-                            legacyType, callbackFlags, callingPackageName, getAttributionTag(),
-                            declaredMethodsFlag);
+                            legacyType, callbackFlags, callingPackageName,
+                            mContext.getAttributionTag(), declaredMethodsFlag);
                 }
                 if (request != null) {
                     sCallbacks.put(request, callback);
@@ -4827,7 +4884,8 @@ public class ConnectivityManager {
         return 0;
     }
 
-    private boolean isFeatureEnabled(@ConnectivityManagerFeature long connectivityManagerFeature) {
+    /** @hide */
+    public boolean isFeatureEnabled(@ConnectivityManagerFeature long connectivityManagerFeature) {
         synchronized (mEnabledConnectivityManagerFeaturesLock) {
             if (mEnabledConnectivityManagerFeatures == null) {
                 try {
@@ -4985,6 +5043,41 @@ public class ConnectivityManager {
     }
 
     /**
+     * Reserve a network to satisfy a set of {@link NetworkCapabilities}.
+     *
+     * Some types of networks require the system to generate (i.e. reserve) some set of information
+     * before a network can be connected. For such networks, {@link #reserveNetwork} can be used
+     * which may lead to a call to {@link NetworkCallback#onReserved(NetworkCapabilities)}
+     * containing the {@link NetworkCapabilities} that were reserved.
+     *
+     * A reservation reserves at most one network. If the network connects, a reservation request
+     * behaves similar to a request filed using {@link #requestNetwork}. The provided {@link
+     * NetworkCallback} will only be called for the reserved network.
+     *
+     * If the system determines that the requested reservation can never be fulfilled, {@link
+     * NetworkCallback#onUnavailable} is called, the reservation is released by the system, and the
+     * provided callback can be reused. Otherwise, the reservation remains in place until the
+     * requested network connects. There is no guarantee that the reserved network will ever
+     * connect.
+     *
+     * @param request {@link NetworkRequest} describing this request.
+     * @param handler {@link Handler} to specify the thread upon which the callback will be invoked.
+     * @param networkCallback The {@link NetworkCallback} to be utilized for this request. Note
+     *                        the callback must not be shared - it uniquely specifies this request.
+     */
+    // TODO: add executor overloads for all network request methods. Any method that passed an
+    // Executor could process the messages on the singleton ConnectivityThread Handler.
+    @SuppressLint("ExecutorRegistration")
+    @FlaggedApi(Flags.FLAG_IPV6_OVER_BLE)
+    public void reserveNetwork(@NonNull NetworkRequest request,
+            @NonNull Handler handler,
+            @NonNull NetworkCallback networkCallback) {
+        final CallbackHandler cbHandler = new CallbackHandler(handler);
+        final NetworkCapabilities nc = request.networkCapabilities;
+        sendRequestForNetwork(nc, networkCallback, 0, RESERVATION, TYPE_NONE, cbHandler);
+    }
+
+    /**
      * Request a network to satisfy a set of {@link NetworkCapabilities}, limited
      * by a timeout.
      *
@@ -5127,7 +5220,7 @@ public class ConnectivityManager {
         try {
             mService.pendingRequestForNetwork(
                     request.networkCapabilities, operation, mContext.getOpPackageName(),
-                    getAttributionTag());
+                    mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         } catch (ServiceSpecificException e) {
@@ -5276,7 +5369,7 @@ public class ConnectivityManager {
         try {
             mService.pendingListenForNetwork(
                     request.networkCapabilities, operation, mContext.getOpPackageName(),
-                    getAttributionTag());
+                    mContext.getAttributionTag());
         } catch (RemoteException e) {
             throw e.rethrowFromSystemServer();
         } catch (ServiceSpecificException e) {

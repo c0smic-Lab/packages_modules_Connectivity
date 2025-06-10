@@ -28,6 +28,7 @@ import android.annotation.SystemApi;
 import android.content.Context;
 import android.net.wifi.SoftApConfiguration;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.ConditionVariable;
 import android.os.IBinder;
@@ -36,11 +37,13 @@ import android.os.Parcelable;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.ResultReceiver;
+import android.text.TextUtils;
 import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Log;
 
 import com.android.internal.annotations.GuardedBy;
+import com.android.modules.utils.build.SdkLevel;
 import com.android.net.flags.Flags;
 
 import java.lang.annotation.Retention;
@@ -332,6 +335,16 @@ public class TetheringManager {
     public static final int TETHER_ERROR_UNKNOWN_REQUEST = 17;
     @FlaggedApi(Flags.FLAG_TETHERING_WITH_SOFT_AP_CONFIG)
     public static final int TETHER_ERROR_DUPLICATE_REQUEST = 18;
+    /**
+     * Never used outside Tethering.java.
+     * @hide
+     */
+    public static final int TETHER_ERROR_BLUETOOTH_SERVICE_PENDING = 19;
+    /**
+     * Never used outside Tethering.java.
+     * @hide
+     */
+    public static final int TETHER_ERROR_SOFT_AP_CALLBACK_PENDING = 20;
 
     /** @hide */
     @Retention(RetentionPolicy.SOURCE)
@@ -388,7 +401,9 @@ public class TetheringManager {
         // up and be sent from a worker thread; later, they are always sent from the caller thread.
         // Considering that it's just oneway binder calls, and ordering is preserved, this seems
         // better than inconsistent behavior persisting after boot.
-        if (connector != null) {
+        // If system server restarted, mConnectorSupplier might temporarily return a stale (i.e.
+        // dead) version of TetheringService.
+        if (connector != null && connector.isBinderAlive()) {
             mConnector = ITetheringConnector.Stub.asInterface(connector);
         } else {
             startPollingForConnector();
@@ -423,9 +438,8 @@ public class TetheringManager {
                 } catch (InterruptedException e) {
                     // Not much to do here, the system needs to wait for the connector
                 }
-
                 final IBinder connector = mConnectorSupplier.get();
-                if (connector != null) {
+                if (connector != null && connector.isBinderAlive()) {
                     onTetheringConnected(ITetheringConnector.Stub.asInterface(connector));
                     return;
                 }
@@ -656,6 +670,13 @@ public class TetheringManager {
         }
     }
 
+    private void unsupportedAfterV() {
+        if (SdkLevel.isAtLeastB()) {
+            throw new UnsupportedOperationException("Not supported after SDK version "
+                    + Build.VERSION_CODES.VANILLA_ICE_CREAM);
+        }
+    }
+
     /**
      * Attempt to tether the named interface.  This will setup a dhcp server
      * on the interface, forward and NAT IP v4 packets and forward DNS requests
@@ -665,8 +686,10 @@ public class TetheringManager {
      * access will of course fail until an upstream network interface becomes
      * active.
      *
-     * @deprecated The only usages is PanService. It uses this for legacy reasons
-     * and will migrate away as soon as possible.
+     * @deprecated Legacy tethering API. Callers should instead use
+     *             {@link #startTethering(int, Executor, StartTetheringCallback)}.
+     *             On SDK versions after {@link Build.VERSION_CODES.VANILLA_ICE_CREAM}, this will
+     *             throw an UnsupportedOperationException.
      *
      * @param iface the interface name to tether.
      * @return error a {@code TETHER_ERROR} value indicating success or failure type
@@ -676,6 +699,8 @@ public class TetheringManager {
     @Deprecated
     @SystemApi(client = MODULE_LIBRARIES)
     public int tether(@NonNull final String iface) {
+        unsupportedAfterV();
+
         final String callerPkg = mContext.getOpPackageName();
         Log.i(TAG, "tether caller:" + callerPkg);
         final RequestDispatcher dispatcher = new RequestDispatcher();
@@ -699,14 +724,18 @@ public class TetheringManager {
     /**
      * Stop tethering the named interface.
      *
-     * @deprecated The only usages is PanService. It uses this for legacy reasons
-     * and will migrate away as soon as possible.
+     * @deprecated Legacy tethering API. Callers should instead use
+     *             {@link #stopTethering(int)}.
+     *             On SDK versions after {@link Build.VERSION_CODES.VANILLA_ICE_CREAM}, this will
+     *             throw an UnsupportedOperationException.
      *
      * {@hide}
      */
     @Deprecated
     @SystemApi(client = MODULE_LIBRARIES)
     public int untether(@NonNull final String iface) {
+        unsupportedAfterV();
+
         final String callerPkg = mContext.getOpPackageName();
         Log.i(TAG, "untether caller:" + callerPkg);
 
@@ -790,6 +819,46 @@ public class TetheringManager {
      */
     @SuppressLint("UnflaggedApi")
     public static final class TetheringRequest implements Parcelable {
+        /**
+         * Tethering started by an explicit call to startTethering.
+         * @hide
+         */
+        public static final int REQUEST_TYPE_EXPLICIT = 0;
+
+        /**
+         * Tethering implicitly started by broadcasts (LOHS and P2P). Can never be pending.
+         * @hide
+         */
+        public static final int REQUEST_TYPE_IMPLICIT = 1;
+
+        /**
+         * Tethering started by the legacy tether() call. Can only happen on V-.
+         * @hide
+         */
+        public static final int REQUEST_TYPE_LEGACY = 2;
+
+        /**
+         * Tethering started but there was no pending request found. This may happen if Tethering is
+         * started and immediately stopped before the link layer goes up, or if we get a link layer
+         * event without a prior call to startTethering (e.g. adb shell cmd wifi start-softap).
+         * @hide
+         */
+        public static final int REQUEST_TYPE_PLACEHOLDER = 3;
+
+        /**
+         * Type of request, used to keep track of whether the request was explicitly sent by
+         * startTethering, implicitly created by broadcasts, or via legacy tether().
+         * @hide
+         */
+        @Retention(RetentionPolicy.SOURCE)
+        @IntDef(prefix = "TYPE_", value = {
+                REQUEST_TYPE_EXPLICIT,
+                REQUEST_TYPE_IMPLICIT,
+                REQUEST_TYPE_LEGACY,
+                REQUEST_TYPE_PLACEHOLDER,
+        })
+        public @interface RequestType {}
+
         /** A configuration set for TetheringRequest. */
         private final TetheringRequestParcel mRequestParcel;
 
@@ -849,6 +918,7 @@ public class TetheringManager {
                 mBuilderParcel.uid = Process.INVALID_UID;
                 mBuilderParcel.softApConfig = null;
                 mBuilderParcel.interfaceName = null;
+                mBuilderParcel.requestType = REQUEST_TYPE_EXPLICIT;
             }
 
             /**
@@ -1144,6 +1214,14 @@ public class TetheringManager {
         }
 
         /**
+         * Get the type of the request.
+         * @hide
+         */
+        public @RequestType int getRequestType() {
+            return mRequestParcel.requestType;
+        }
+
+        /**
          * String of TetheringRequest detail.
          * @hide
          */
@@ -1151,6 +1229,13 @@ public class TetheringManager {
         public String toString() {
             StringJoiner sj = new StringJoiner(", ", "TetheringRequest[ ", " ]");
             sj.add(typeToString(mRequestParcel.tetheringType));
+            if (mRequestParcel.requestType == REQUEST_TYPE_IMPLICIT) {
+                sj.add("IMPLICIT");
+            } else if (mRequestParcel.requestType == REQUEST_TYPE_LEGACY) {
+                sj.add("LEGACY");
+            } else if (mRequestParcel.requestType == REQUEST_TYPE_PLACEHOLDER) {
+                sj.add("PLACEHOLDER");
+            }
             if (mRequestParcel.localIPv4Address != null) {
                 sj.add("localIpv4Address=" + mRequestParcel.localIPv4Address);
             }
@@ -1179,6 +1264,44 @@ public class TetheringManager {
             return sj.toString();
         }
 
+        @SuppressLint("UnflaggedApi")
+        private static boolean supportsInterfaceName(int tetheringType) {
+            // TODO: Check the interface name for TETHERING_WIFI and TETHERING_WIFI_P2P once
+            //       they're actually used.
+            // Suppress lint for TETHERING_VIRTUAL since this method is only used internally.
+            return tetheringType == TETHERING_VIRTUAL;
+        }
+
+        private static boolean supportsConcurrentConnectivityScopes(int tetheringType) {
+            // Currently, only WIFI supports simultaneous local and global connectivity.
+            // This can't happen for REQUEST_TYPE_EXPLICIT requests, because
+            // TetheringRequest.Builder will not allow building an explicit TetheringRequest
+            // with TETHERING_WIFI and CONNECTIVITY_SCOPE_LOCAL, but when local-only hotspot
+            // is running, there is a REQUEST_TYPE_IMPLICIT request in the serving request list.
+            return tetheringType == TETHERING_WIFI;
+        }
+
+        /**
+         * Returns true if the other TetheringRequest "fuzzy" matches this one. This is used
+         * internally to match tracked requests with external requests from API calls, and to reject
+         * additional requests that the link layer has no capacity for.
+         * @hide
+         */
+        public boolean fuzzyMatches(final TetheringRequest other) {
+            if (other == null) return false;
+            final int type = getTetheringType();
+            if (type != other.getTetheringType()) return false;
+            if (supportsInterfaceName(type)
+                    && !TextUtils.equals(getInterfaceName(), other.getInterfaceName())) {
+                return false;
+            }
+            if (supportsConcurrentConnectivityScopes(type)
+                    && getConnectivityScope() != other.getConnectivityScope()) {
+                return false;
+            }
+            return true;
+        }
+
         /**
          * @hide
          */
@@ -1187,17 +1310,29 @@ public class TetheringManager {
         public boolean equals(Object obj) {
             if (this == obj) return true;
             if (!(obj instanceof TetheringRequest otherRequest)) return false;
+            if (!equalsIgnoreUidPackage(otherRequest)) return false;
             TetheringRequestParcel parcel = getParcel();
             TetheringRequestParcel otherParcel = otherRequest.getParcel();
-            return parcel.tetheringType == otherParcel.tetheringType
+            return parcel.uid == otherParcel.uid
+                    && Objects.equals(parcel.packageName, otherParcel.packageName);
+        }
+
+        /**
+         * @hide
+         */
+        public boolean equalsIgnoreUidPackage(TetheringRequest otherRequest) {
+            TetheringRequestParcel parcel = getParcel();
+            TetheringRequestParcel otherParcel = otherRequest.getParcel();
+            // Note: Changes here should also be reflected in fuzzyMatches(TetheringRequest) when
+            //       appropriate.
+            return parcel.requestType == otherParcel.requestType
+                    && parcel.tetheringType == otherParcel.tetheringType
                     && Objects.equals(parcel.localIPv4Address, otherParcel.localIPv4Address)
                     && Objects.equals(parcel.staticClientAddress, otherParcel.staticClientAddress)
                     && parcel.exemptFromEntitlementCheck == otherParcel.exemptFromEntitlementCheck
                     && parcel.showProvisioningUi == otherParcel.showProvisioningUi
                     && parcel.connectivityScope == otherParcel.connectivityScope
                     && Objects.equals(parcel.softApConfig, otherParcel.softApConfig)
-                    && parcel.uid == otherParcel.uid
-                    && Objects.equals(parcel.packageName, otherParcel.packageName)
                     && Objects.equals(parcel.interfaceName, otherParcel.interfaceName);
         }
 
@@ -1290,18 +1425,12 @@ public class TetheringManager {
      * Starts tethering and runs tether provisioning for the given type if needed. If provisioning
      * fails, stopTethering will be called automatically.
      *
-     * <p>Without {@link android.Manifest.permission.TETHER_PRIVILEGED} permission, the call will
-     * fail if a tethering entitlement check is required.
-     *
      * @param type The tethering type, on of the {@code TetheringManager#TETHERING_*} constants.
      * @param executor {@link Executor} to specify the thread upon which the callback of
      *         TetheringRequest will be invoked.
      * @hide
      */
-    @RequiresPermission(anyOf = {
-            android.Manifest.permission.TETHER_PRIVILEGED,
-            android.Manifest.permission.WRITE_SETTINGS
-    })
+    @RequiresPermission(android.Manifest.permission.TETHER_PRIVILEGED)
     @SystemApi(client = MODULE_LIBRARIES)
     public void startTethering(int type, @NonNull final Executor executor,
             @NonNull final StartTetheringCallback callback) {
@@ -1312,14 +1441,9 @@ public class TetheringManager {
      * Stops tethering for the given type. Also cancels any provisioning rechecks for that type if
      * applicable.
      *
-     * <p>Without {@link android.Manifest.permission.TETHER_PRIVILEGED} permission, the call will
-     * fail if a tethering entitlement check is required.
      * @hide
      */
-    @RequiresPermission(anyOf = {
-            android.Manifest.permission.TETHER_PRIVILEGED,
-            android.Manifest.permission.WRITE_SETTINGS
-    })
+    @RequiresPermission(android.Manifest.permission.TETHER_PRIVILEGED)
     @SystemApi
     public void stopTethering(@TetheringType final int type) {
         final String callerPkg = mContext.getOpPackageName();
@@ -1345,7 +1469,25 @@ public class TetheringManager {
     @FlaggedApi(Flags.FLAG_TETHERING_WITH_SOFT_AP_CONFIG)
     public void stopTethering(@NonNull TetheringRequest request,
             @NonNull final Executor executor, @NonNull final StopTetheringCallback callback) {
-        throw new UnsupportedOperationException();
+        Objects.requireNonNull(request);
+        Objects.requireNonNull(executor);
+        Objects.requireNonNull(callback);
+
+        final String callerPkg = mContext.getOpPackageName();
+        Log.i(TAG, "stopTethering: request=" + request + ", caller=" + callerPkg);
+        getConnector(c -> c.stopTetheringRequest(request, callerPkg, getAttributionTag(),
+                new IIntResultListener.Stub() {
+                    @Override
+                    public void onResult(final int resultCode) {
+                        executor.execute(() -> {
+                            if (resultCode == TETHER_ERROR_NO_ERROR) {
+                                callback.onStopTetheringSucceeded();
+                            } else {
+                                callback.onStopTetheringFailed(resultCode);
+                            }
+                        });
+                    }
+                }));
     }
 
     /**
@@ -1374,9 +1516,6 @@ public class TetheringManager {
      * {@link #TETHER_ERROR_ENTITLEMENT_UNKNOWN} will be returned. If {@code showEntitlementUi} is
      * true, entitlement will be run.
      *
-     * <p>Without {@link android.Manifest.permission.TETHER_PRIVILEGED} permission, the call will
-     * fail if a tethering entitlement check is required.
-     *
      * @param type the downstream type of tethering. Must be one of {@code #TETHERING_*} constants.
      * @param showEntitlementUi a boolean indicating whether to check result for the UI-based
      *         entitlement check or the silent entitlement check.
@@ -1387,10 +1526,7 @@ public class TetheringManager {
      * @hide
      */
     @SystemApi
-    @RequiresPermission(anyOf = {
-            android.Manifest.permission.TETHER_PRIVILEGED,
-            android.Manifest.permission.WRITE_SETTINGS
-    })
+    @RequiresPermission(android.Manifest.permission.TETHER_PRIVILEGED)
     public void requestLatestTetheringEntitlementResult(@TetheringType int type,
             boolean showEntitlementUi,
             @NonNull Executor executor,
@@ -2073,10 +2209,7 @@ public class TetheringManager {
      * @hide
      */
     @SystemApi
-    @RequiresPermission(anyOf = {
-            android.Manifest.permission.TETHER_PRIVILEGED,
-            android.Manifest.permission.WRITE_SETTINGS
-    })
+    @RequiresPermission(android.Manifest.permission.TETHER_PRIVILEGED)
     public void stopAllTethering() {
         final String callerPkg = mContext.getOpPackageName();
         Log.i(TAG, "stopAllTethering caller:" + callerPkg);

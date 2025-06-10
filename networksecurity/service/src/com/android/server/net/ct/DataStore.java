@@ -44,8 +44,9 @@ class DataStore extends Properties {
         }
         try (InputStream in = new FileInputStream(mPropertyFile)) {
             load(in);
-        } catch (IOException e) {
+        } catch (IOException | IllegalArgumentException e) {
             Log.e(TAG, "Error loading property store", e);
+            delete();
         }
     }
 
@@ -57,11 +58,24 @@ class DataStore extends Properties {
         }
     }
 
+    boolean delete() {
+        clear();
+        return mPropertyFile.delete();
+    }
+
     long getPropertyLong(String key, long defaultValue) {
         return Optional.ofNullable(getProperty(key)).map(Long::parseLong).orElse(defaultValue);
     }
 
     Object setPropertyLong(String key, long value) {
         return setProperty(key, Long.toString(value));
+    }
+
+    int getPropertyInt(String key, int defaultValue) {
+        return Optional.ofNullable(getProperty(key)).map(Integer::parseInt).orElse(defaultValue);
+    }
+
+    Object setPropertyInt(String key, int value) {
+        return setProperty(key, Integer.toString(value));
     }
 }

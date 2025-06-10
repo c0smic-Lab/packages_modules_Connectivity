@@ -22,6 +22,7 @@ cc_library_shared {
     ],
 
     shared_libs: [
+        "libbase",
         "liblog",
         "libnativehelper",
         "libnetdutils",
@@ -42,7 +43,7 @@ cc_library_shared {
     ],
     static_libs: [
         "libnet_utils_device_common_bpfjni",
-        "libnet_utils_device_common_timerfdjni",
+        "libserviceconnectivityjni",
         "libtcutils",
     ],
     shared_libs: [

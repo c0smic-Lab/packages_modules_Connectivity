@@ -23,6 +23,7 @@ import android.app.AlarmManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.pm.PackageManager.FEATURE_BLUETOOTH
+import android.content.pm.PackageManager.FEATURE_BLUETOOTH_LE
 import android.content.pm.PackageManager.FEATURE_ETHERNET
 import android.content.pm.PackageManager.FEATURE_WIFI
 import android.content.pm.PackageManager.FEATURE_WIFI_DIRECT
@@ -33,6 +34,7 @@ import android.net.INetd
 import android.net.IpPrefix
 import android.net.LinkAddress
 import android.net.LinkProperties
+import android.net.LocalNetworkConfig
 import android.net.NetworkAgentConfig
 import android.net.NetworkCapabilities
 import android.net.NetworkScore
@@ -53,6 +55,7 @@ import com.android.internal.util.test.FakeSettingsProvider
 import com.android.modules.utils.build.SdkLevel
 import com.android.server.ConnectivityService.Dependencies
 import com.android.server.connectivity.ConnectivityResources
+import com.android.server.connectivity.PermissionMonitor
 import kotlin.test.fail
 import org.mockito.ArgumentMatchers
 import org.mockito.ArgumentMatchers.any
@@ -82,6 +85,11 @@ internal fun defaultNc() = NetworkCapabilities.Builder()
 
 internal fun defaultScore() = FromS(NetworkScore.Builder().build())
 
+internal fun keepConnectedScore() = FromS(NetworkScore.Builder()
+                .setKeepConnectedReason(NetworkScore.KEEP_CONNECTED_FOR_TEST).build())
+
+internal fun defaultLnc() = FromS(LocalNetworkConfig.Builder().build())
+
 internal fun defaultLp() = LinkProperties().apply {
     addLinkAddress(LinkAddress(LOCAL_IPV4_ADDRESS, 32))
     addRoute(RouteInfo(IpPrefix("0.0.0.0/0"), null, null))
@@ -103,11 +111,19 @@ internal fun makeActivityManager() = mock<ActivityManager>().also {
 }
 
 internal fun makeMockPackageManager(realContext: Context) = mock<PackageManager>().also { pm ->
-    val supported = listOf(FEATURE_WIFI, FEATURE_WIFI_DIRECT, FEATURE_BLUETOOTH, FEATURE_ETHERNET)
+    val supported = listOf(
+            FEATURE_WIFI,
+            FEATURE_WIFI_DIRECT,
+            FEATURE_BLUETOOTH,
+            FEATURE_BLUETOOTH_LE,
+            FEATURE_ETHERNET
+    )
     doReturn(true).`when`(pm).hasSystemFeature(argThat { supported.contains(it) })
     val myPackageName = realContext.packageName
-    val myPackageInfo = realContext.packageManager.getPackageInfo(myPackageName,
-            PackageManager.GET_PERMISSIONS)
+    val myPackageInfo = realContext.packageManager.getPackageInfo(
+        myPackageName,
+            PackageManager.GET_PERMISSIONS
+    )
     // Very high version code so that the checks for the module version will always
     // say that it is recent enough. This is the most sensible default, but if some
     // test needs to test with different version codes they can re-mock this with a
@@ -115,7 +131,10 @@ internal fun makeMockPackageManager(realContext: Context) = mock<PackageManager>
     myPackageInfo.longVersionCode = 9999999L
     doReturn(arrayOf(myPackageName)).`when`(pm).getPackagesForUid(Binder.getCallingUid())
     doReturn(myPackageInfo).`when`(pm).getPackageInfoAsUser(
-            eq(myPackageName), anyInt(), eq(UserHandle.getCallingUserId()))
+            eq(myPackageName),
+            anyInt(),
+            eq(UserHandle.getCallingUserId())
+    )
     doReturn(listOf(myPackageInfo)).`when`(pm)
             .getInstalledPackagesAsUser(eq(PackageManager.GET_PERMISSIONS), anyInt())
 }
@@ -136,12 +155,19 @@ internal fun makeMockAlarmManager(handlerThread: HandlerThread) = mock<AlarmMana
         handler as Handler
         val delayMs = ((date as Long) - SystemClock.elapsedRealtime()).coerceAtLeast(0)
         if (delayMs > UNREASONABLY_LONG_ALARM_WAIT_MS) {
-            fail("Attempting to send msg more than $UNREASONABLY_LONG_ALARM_WAIT_MS" +
-                    "ms into the future : $delayMs")
+            fail(
+                "Attempting to send msg more than $UNREASONABLY_LONG_ALARM_WAIT_MS" +
+                    "ms into the future : $delayMs"
+            )
         }
         alrmHdlr.postDelayed({ handler.post(wakeupMsg::onAlarm) }, wakeupMsg, delayMs)
-    }.`when`(am).setExact(eq(AlarmManager.ELAPSED_REALTIME_WAKEUP), anyLong(), anyString(),
-            any<WakeupMessage>(), any())
+    }.`when`(am).setExact(
+            eq(AlarmManager.ELAPSED_REALTIME_WAKEUP),
+            anyLong(),
+            anyString(),
+            any<WakeupMessage>(),
+            any()
+    )
     doAnswer {
         alrmHdlr.removeCallbacksAndMessages(it.getArgument<WakeupMessage>(0))
     }.`when`(am).cancel(any<WakeupMessage>())
@@ -185,13 +211,20 @@ internal fun initMockedResources(res: Resources) {
 
 private val TEST_LINGER_DELAY_MS = 400
 private val TEST_NASCENT_DELAY_MS = 300
-internal fun makeConnectivityService(context: Context, netd: INetd, deps: Dependencies) =
+internal fun makeConnectivityService(
+        context: Context,
+        netd: INetd,
+        deps: Dependencies,
+        mPermDeps: PermissionMonitor.Dependencies
+) =
         ConnectivityService(
                 context,
                 mock<IDnsResolver>(),
                 mock<IpConnectivityLog>(),
                 netd,
-                deps).also {
+                deps,
+                mPermDeps
+        ).also {
             it.mLingerDelayMs = TEST_LINGER_DELAY_MS
             it.mNascentDelayMs = TEST_NASCENT_DELAY_MS
         }

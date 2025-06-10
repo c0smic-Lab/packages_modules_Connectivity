@@ -47,15 +47,6 @@ enable_tethering_next_apex = true
 // as the above target may have different "enabled" values
 // depending on the branch
 
-apex_defaults {
-    name: "CronetInTetheringApexDefaults",
-    jni_libs: [
-        "cronet_aml_components_cronet_android_cronet",
-        "//external/cronet/third_party/boringssl:libcrypto",
-        "//external/cronet/third_party/boringssl:libssl",
-    ],
-}
-
 apex {
     name: "com.android.tethering",
     defaults: [
@@ -102,15 +93,14 @@ apex {
         "dscpPolicy.o",
         "netd.o",
         "offload.o",
-        "offload@mainline.o",
         "test.o",
-        "test@mainline.o",
     ],
     apps: [
         "ServiceConnectivityResources",
     ],
     prebuilts: [
         "current_sdkinfo",
+        "netbpfload.31rc",
         "netbpfload.33rc",
         "netbpfload.35rc",
         "ot-daemon.34rc",
@@ -155,7 +145,10 @@ bootclasspath_fragment {
         "framework-connectivity",
         "framework-connectivity-t",
         "framework-tethering",
-    ],
+    ] + select(release_flag("RELEASE_MOVE_VCN_TO_MAINLINE"), {
+        true: ["framework-connectivity-b"],
+        default: [],
+    }),
     apex_available: ["com.android.tethering"],
 
     // The bootclasspath_fragments that provide APIs on which this depends.
@@ -195,6 +188,7 @@ bootclasspath_fragment {
             "android.net.http",
             "android.net.netstats",
             "android.net.util",
+            "android.net.vcn",
         ],
 
         // The following packages and all their subpackages currently only

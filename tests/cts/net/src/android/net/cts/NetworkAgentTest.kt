@@ -15,7 +15,7 @@
  */
 package android.net.cts
 
-import android.Manifest.permission.MODIFY_PHONE_STATE
+import android.Manifest.permission.NEARBY_WIFI_DEVICES
 import android.Manifest.permission.NETWORK_SETTINGS
 import android.Manifest.permission.READ_PRIVILEGED_PHONE_STATE
 import android.app.Instrumentation
@@ -80,12 +80,10 @@ import android.net.cts.NetworkAgentTest.TestableQosCallback.CallbackEntry.OnQosS
 import android.net.cts.NetworkAgentTest.TestableQosCallback.CallbackEntry.OnQosSessionLost
 import android.net.wifi.WifiInfo
 import android.os.Build
-import android.os.ConditionVariable
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.os.Message
-import android.os.PersistableBundle
 import android.os.Process
 import android.os.SystemClock
 import android.platform.test.annotations.AppModeFull
@@ -94,19 +92,15 @@ import android.system.OsConstants.AF_INET6
 import android.system.OsConstants.IPPROTO_TCP
 import android.system.OsConstants.IPPROTO_UDP
 import android.system.OsConstants.SOCK_DGRAM
-import android.telephony.CarrierConfigManager
 import android.telephony.SubscriptionManager
 import android.telephony.TelephonyManager
-import android.telephony.TelephonyManager.CarrierPrivilegesCallback
 import android.telephony.data.EpsBearerQosSessionAttributes
 import android.util.ArraySet
 import android.util.DebugUtils.valueToString
-import android.util.Log
 import androidx.test.InstrumentationRegistry
 import com.android.compatibility.common.util.SystemUtil.runShellCommand
 import com.android.compatibility.common.util.SystemUtil.runWithShellPermissionIdentity
 import com.android.compatibility.common.util.ThrowingSupplier
-import com.android.compatibility.common.util.UiccUtil
 import com.android.modules.utils.build.SdkLevel
 import com.android.net.module.util.ArrayTrackRecord
 import com.android.net.module.util.NetworkStackConstants.ETHER_MTU
@@ -117,13 +111,13 @@ import com.android.testutils.CompatUtil
 import com.android.testutils.ConnectivityModuleTest
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo
 import com.android.testutils.DevSdkIgnoreRunner
+import com.android.testutils.PollPacketReader
 import com.android.testutils.RecorderCallback.CallbackEntry.Available
 import com.android.testutils.RecorderCallback.CallbackEntry.BlockedStatus
 import com.android.testutils.RecorderCallback.CallbackEntry.CapabilitiesChanged
 import com.android.testutils.RecorderCallback.CallbackEntry.LinkPropertiesChanged
 import com.android.testutils.RecorderCallback.CallbackEntry.Losing
 import com.android.testutils.RecorderCallback.CallbackEntry.Lost
-import com.android.testutils.PollPacketReader
 import com.android.testutils.TestableNetworkAgent
 import com.android.testutils.TestableNetworkAgent.CallbackEntry.OnAddKeepalivePacketFilter
 import com.android.testutils.TestableNetworkAgent.CallbackEntry.OnAutomaticReconnectDisabled
@@ -140,6 +134,7 @@ import com.android.testutils.TestableNetworkAgent.CallbackEntry.OnUnregisterQosC
 import com.android.testutils.TestableNetworkAgent.CallbackEntry.OnValidationStatus
 import com.android.testutils.TestableNetworkCallback
 import com.android.testutils.assertThrows
+import com.android.testutils.com.android.testutils.CarrierConfigRule
 import com.android.testutils.runAsShell
 import com.android.testutils.tryTest
 import com.android.testutils.waitForIdle
@@ -149,14 +144,13 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.security.MessageDigest
 import java.nio.ByteBuffer
 import java.time.Duration
 import java.util.Arrays
-import java.util.Random
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.collections.ArrayList
+import kotlin.random.Random
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -167,9 +161,11 @@ import kotlin.test.fail
 import org.junit.After
 import org.junit.Assume.assumeTrue
 import org.junit.Before
+import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.anyInt
 import org.mockito.ArgumentMatchers.argThat
 import org.mockito.ArgumentMatchers.eq
 import org.mockito.Mockito.doReturn
@@ -178,10 +174,16 @@ import org.mockito.Mockito.timeout
 import org.mockito.Mockito.verify
 
 private const val TAG = "NetworkAgentTest"
+
 // This test doesn't really have a constraint on how fast the methods should return. If it's
 // going to fail, it will simply wait forever, so setting a high timeout lowers the flake ratio
 // without affecting the run time of successful runs. Thus, set a very high timeout.
 private const val DEFAULT_TIMEOUT_MS = 5000L
+
+private const val QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER =
+    "queue_network_agent_events_in_system_server"
+
+
 // When waiting for a NetworkCallback to determine there was no timeout, waiting is the
 // only possible thing (the relevant handler is the one in the real ConnectivityService,
 // and then there is the Binder call), so have a short timeout for this as it will be
@@ -206,12 +208,6 @@ private val REMOTE_ADDRESS = InetAddresses.parseNumericAddress("2001:db8::123")
 private val PREFIX = IpPrefix("2001:db8::/64")
 private val NEXTHOP = InetAddresses.parseNumericAddress("fe80::abcd")
 
-// On T and below, the native network is only created when the agent connects.
-// Starting in U, the native network was to be created as soon as the agent is registered,
-// but this has been flagged off for now pending resolution of race conditions.
-// TODO : enable this in a Mainline update or in V.
-private const val SHOULD_CREATE_NETWORKS_IMMEDIATELY = false
-
 @AppModeFull(reason = "Instant apps can't use NetworkAgent because it needs NETWORK_FACTORY'.")
 // NetworkAgent is updated as part of the connectivity module, and running NetworkAgent tests in MTS
 // for modules other than Connectivity does not provide much value. Only run them in connectivity
@@ -223,6 +219,9 @@ private const val SHOULD_CREATE_NETWORKS_IMMEDIATELY = false
 @IgnoreUpTo(Build.VERSION_CODES.R)
 @RunWith(DevSdkIgnoreRunner::class)
 class NetworkAgentTest {
+    @get:Rule
+    val carrierConfigRule = CarrierConfigRule()
+
     private val LOCAL_IPV4_ADDRESS = InetAddresses.parseNumericAddress("192.0.2.1")
     private val REMOTE_IPV4_ADDRESS = InetAddresses.parseNumericAddress("192.0.2.2")
 
@@ -234,9 +233,27 @@ class NetworkAgentTest {
     private var qosTestSocket: Closeable? = null // either Socket or DatagramSocket
     private val ifacesToCleanUp = mutableListOf<TestNetworkInterface>()
 
+    // Unless the queuing in system server feature is chickened out, native networks are created
+    // immediately. Historically they would only created as they'd connect, which would force
+    // the code to apply link properties multiple times and suffer errors early on. Creating
+    // them early required that ordering between the client and the system server is guaranteed
+    // (at least to some extent), which has been done by moving the event queue from the client
+    // to the system server. When that feature is not chickened out, create networks immediately.
+    private val SHOULD_CREATE_NETWORKS_IMMEDIATELY
+        get() = mCM.isConnectivityServiceFeatureEnabledForTesting(
+            QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER
+        )
+
+
     @Before
     fun setUp() {
         instrumentation.getUiAutomation().adoptShellPermissionIdentity()
+        if (SdkLevel.isAtLeastT()) {
+            instrumentation.getUiAutomation().grantRuntimePermission(
+                "android.net.cts",
+                NEARBY_WIFI_DEVICES
+            )
+        }
         mHandlerThread.start()
     }
 
@@ -259,7 +276,7 @@ class NetworkAgentTest {
     private class FakeConnectivityService {
         val mockRegistry = mock(INetworkAgentRegistry::class.java)
         private var agentField: INetworkAgent? = null
-        private val registry = object : INetworkAgentRegistry.Stub(),
+        val registry: INetworkAgentRegistry = object : INetworkAgentRegistry.Stub(),
                 INetworkAgentRegistry by mockRegistry {
             // asBinder has implementations in both INetworkAgentRegistry.Stub and mockRegistry, so
             // it needs to be disambiguated. Just fail the test as it should be unused here.
@@ -276,7 +293,7 @@ class NetworkAgentTest {
 
         fun connect(agent: INetworkAgent) {
             this.agentField = agent
-            agent.onRegistered(registry)
+            agent.onRegistered()
         }
 
         fun disconnect() = agent.onDisconnected()
@@ -378,11 +395,15 @@ class NetworkAgentTest {
         // Ensure this NetworkAgent is never unneeded by filing a request with its specifier.
         requestNetwork(makeTestNetworkRequest(specifier), callback)
         val nc = makeTestNetworkCapabilities(specifier, transports)
-        val agent = createNetworkAgent(context, initialConfig = initialConfig, initialLp = lp,
-            initialNc = nc)
-        agent.setTeardownDelayMillis(0)
+        val agent = createNetworkAgent(
+            context,
+            initialConfig = initialConfig,
+            initialLp = lp,
+            initialNc = nc
+        )
         // Connect the agent and verify initial status callbacks.
         agent.register()
+        agent.setTeardownDelayMillis(0)
         agent.markConnected()
         agent.expectCallback<OnNetworkCreated>()
         agent.expectPostConnectionCallbacks(expectedInitSignalStrengthThresholds)
@@ -401,7 +422,8 @@ class NetworkAgentTest {
     }
 
     private fun createNetworkAgentWithFakeCS() = createNetworkAgent().also {
-        mFakeConnectivityService.connect(it.registerForTest(Network(FAKE_NET_ID)))
+        val binder = it.registerForTest(Network(FAKE_NET_ID), mFakeConnectivityService.registry)
+        mFakeConnectivityService.connect(binder)
     }
 
     private fun TestableNetworkAgent.expectPostConnectionCallbacks(
@@ -414,7 +436,8 @@ class NetworkAgentTest {
 
     private fun createTunInterface(addrs: Collection<LinkAddress> = emptyList()):
             TestNetworkInterface = realContext.getSystemService(
-                TestNetworkManager::class.java)!!.createTunInterface(addrs).also {
+                TestNetworkManager::class.java
+            )!!.createTunInterface(addrs).also {
             ifacesToCleanUp.add(it)
     }
 
@@ -546,9 +569,12 @@ class NetworkAgentTest {
     @Test
     fun testSocketKeepalive(): Unit = createNetworkAgentWithFakeCS().let { agent ->
         val packet = NattKeepalivePacketData(
-                LOCAL_IPV4_ADDRESS /* srcAddress */, 1234 /* srcPort */,
-                REMOTE_IPV4_ADDRESS /* dstAddress */, 4567 /* dstPort */,
-                ByteArray(100 /* size */))
+            LOCAL_IPV4_ADDRESS /* srcAddress */,
+            1234 /* srcPort */,
+            REMOTE_IPV4_ADDRESS /* dstAddress */,
+            4567 /* dstPort */,
+            ByteArray(100 /* size */)
+        )
         val slot = 4
         val interval = 37
 
@@ -653,8 +679,13 @@ class NetworkAgentTest {
             uid: Int,
             expectUidsPresent: Boolean
     ) {
-        doTestAllowedUids(intArrayOf(transport), uid, expectUidsPresent,
-                specifier = null, transportInfo = null)
+        doTestAllowedUids(
+            intArrayOf(transport),
+            uid,
+            expectUidsPresent,
+            specifier = null,
+            transportInfo = null
+        )
     }
 
     private fun doTestAllowedUidsWithSubId(
@@ -687,94 +718,6 @@ class NetworkAgentTest {
         doTestAllowedUids(transports, uid, expectUidsPresent, specifier, transportInfo)
     }
 
-    private fun setHoldCarrierPrivilege(hold: Boolean, subId: Int) {
-        fun getCertHash(): String {
-            val pkgInfo = realContext.packageManager.getPackageInfo(realContext.opPackageName,
-                    PackageManager.GET_SIGNATURES)
-            val digest = MessageDigest.getInstance("SHA-256")
-            val certHash = digest.digest(pkgInfo.signatures!![0]!!.toByteArray())
-            return UiccUtil.bytesToHexString(certHash)!!
-        }
-
-        val tm = realContext.getSystemService(TelephonyManager::class.java)!!
-        val ccm = realContext.getSystemService(CarrierConfigManager::class.java)!!
-
-        val cv = ConditionVariable()
-        val cpb = PrivilegeWaiterCallback(cv)
-        tryTest {
-            val slotIndex = SubscriptionManager.getSlotIndex(subId)!!
-            runAsShell(READ_PRIVILEGED_PHONE_STATE) {
-                tm.registerCarrierPrivilegesCallback(slotIndex, { it.run() }, cpb)
-            }
-            // Wait for the callback to be registered
-            assertTrue(cv.block(DEFAULT_TIMEOUT_MS), "Can't register CarrierPrivilegesCallback")
-            if (cpb.hasPrivilege == hold) {
-                if (hold) {
-                    Log.w(TAG, "Package ${realContext.opPackageName} already is privileged")
-                } else {
-                    Log.w(TAG, "Package ${realContext.opPackageName} already isn't privileged")
-                }
-                return@tryTest
-            }
-            cv.close()
-            runAsShell(MODIFY_PHONE_STATE) {
-                val carrierConfigs = if (hold) {
-                    PersistableBundle().also {
-                        it.putStringArray(CarrierConfigManager.KEY_CARRIER_CERTIFICATE_STRING_ARRAY,
-                                arrayOf(getCertHash()))
-                    }
-                } else {
-                    null
-                }
-                ccm.overrideConfig(subId, carrierConfigs)
-            }
-            assertTrue(cv.block(DEFAULT_TIMEOUT_MS), "Can't change carrier privilege")
-        } cleanup {
-            runAsShell(READ_PRIVILEGED_PHONE_STATE) {
-                tm.unregisterCarrierPrivilegesCallback(cpb)
-            }
-        }
-    }
-
-    private fun acquireCarrierPrivilege(subId: Int) = setHoldCarrierPrivilege(true, subId)
-    private fun dropCarrierPrivilege(subId: Int) = setHoldCarrierPrivilege(false, subId)
-
-    private fun setCarrierServicePackageOverride(subId: Int, pkg: String?) {
-        val tm = realContext.getSystemService(TelephonyManager::class.java)!!
-
-        val cv = ConditionVariable()
-        val cpb = CarrierServiceChangedWaiterCallback(cv)
-        tryTest {
-            val slotIndex = SubscriptionManager.getSlotIndex(subId)!!
-            runAsShell(READ_PRIVILEGED_PHONE_STATE) {
-                tm.registerCarrierPrivilegesCallback(slotIndex, { it.run() }, cpb)
-            }
-            // Wait for the callback to be registered
-            assertTrue(cv.block(DEFAULT_TIMEOUT_MS), "Can't register CarrierPrivilegesCallback")
-            if (cpb.pkgName == pkg) {
-                Log.w(TAG, "Carrier service package was already $pkg")
-                return@tryTest
-            }
-            cv.close()
-            runAsShell(MODIFY_PHONE_STATE) {
-                if (null == pkg) {
-                    // There is a bug is clear-carrier-service-package-override where not adding
-                    // the -s argument will use the wrong slot index : b/299604822
-                    runShellCommand("cmd phone clear-carrier-service-package-override" +
-                            " -s $subId")
-                } else {
-                    // -s could set the subId, but this test works with the default subId.
-                    runShellCommand("cmd phone set-carrier-service-package-override $pkg")
-                }
-            }
-            assertTrue(cv.block(DEFAULT_TIMEOUT_MS), "Can't modify carrier service package")
-        } cleanup {
-            runAsShell(READ_PRIVILEGED_PHONE_STATE) {
-                tm.unregisterCarrierPrivilegesCallback(cpb)
-            }
-        }
-    }
-
     private fun String.execute() = runShellCommand(this).trim()
 
     @Test
@@ -799,31 +742,48 @@ class NetworkAgentTest {
         val uid = try {
             realContext.packageManager.getApplicationInfo(servicePackage, 0).uid
         } catch (e: PackageManager.NameNotFoundException) {
-            fail("$servicePackage could not be installed, please check the SuiteApkInstaller" +
-                    " installed CtsCarrierServicePackage.apk", e)
+            fail(
+                "$servicePackage could not be installed, please check the SuiteApkInstaller" +
+                    " installed CtsCarrierServicePackage.apk",
+                e
+            )
         }
 
         val tm = realContext.getSystemService(TelephonyManager::class.java)!!
         val defaultSubId = SubscriptionManager.getDefaultSubscriptionId()
-        assertTrue(defaultSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID,
-                "getDefaultSubscriptionId returns INVALID_SUBSCRIPTION_ID")
+        assertTrue(
+            defaultSubId != SubscriptionManager.INVALID_SUBSCRIPTION_ID,
+            "getDefaultSubscriptionId returns INVALID_SUBSCRIPTION_ID"
+        )
         tryTest {
             // This process is not the carrier service UID, so allowedUids should be ignored in all
             // the following cases.
-            doTestAllowedUidsWithSubId(defaultSubId, TRANSPORT_CELLULAR, uid,
-                    expectUidsPresent = false)
-            doTestAllowedUidsWithSubId(defaultSubId, TRANSPORT_WIFI, uid,
-                    expectUidsPresent = false)
-            doTestAllowedUidsWithSubId(defaultSubId, TRANSPORT_BLUETOOTH, uid,
-                    expectUidsPresent = false)
+            doTestAllowedUidsWithSubId(
+                defaultSubId,
+                TRANSPORT_CELLULAR,
+                uid,
+                    expectUidsPresent = false
+            )
+            doTestAllowedUidsWithSubId(
+                defaultSubId,
+                TRANSPORT_WIFI,
+                uid,
+                    expectUidsPresent = false
+            )
+            doTestAllowedUidsWithSubId(
+                defaultSubId,
+                TRANSPORT_BLUETOOTH,
+                uid,
+                    expectUidsPresent = false
+            )
 
             // The tools to set the carrier service package override do not exist before U,
             // so there is no way to test the rest of this test on < U.
             if (!SdkLevel.isAtLeastU()) return@tryTest
             // Acquiring carrier privilege is necessary to override the carrier service package.
             val defaultSlotIndex = SubscriptionManager.getSlotIndex(defaultSubId)
-            acquireCarrierPrivilege(defaultSubId)
-            setCarrierServicePackageOverride(defaultSubId, servicePackage)
+            carrierConfigRule.acquireCarrierPrivilege(defaultSubId)
+            carrierConfigRule.setCarrierServicePackageOverride(defaultSubId, servicePackage)
             val actualServicePackage: String? = runAsShell(READ_PRIVILEGED_PHONE_STATE) {
                 tm.getCarrierServicePackageNameForLogicalSlot(defaultSlotIndex)
             }
@@ -833,9 +793,11 @@ class NetworkAgentTest {
             val timeout = SystemClock.elapsedRealtime() + DEFAULT_TIMEOUT_MS
             while (true) {
                 if (SystemClock.elapsedRealtime() > timeout) {
-                    fail("Couldn't make $servicePackage the service package for $defaultSubId: " +
+                    fail(
+                        "Couldn't make $servicePackage the service package for $defaultSubId: " +
                             "dumpsys connectivity".execute().split("\n")
-                                    .filter { it.contains("Logical slot = $defaultSlotIndex.*") })
+                                    .filter { it.contains("Logical slot = $defaultSlotIndex.*") }
+                    )
                 }
                 if ("dumpsys connectivity"
                         .execute()
@@ -858,14 +820,18 @@ class NetworkAgentTest {
                 // TODO(b/315136340): Allow ownerUid to see allowedUids and enable below test case
                 // doTestAllowedUids(defaultSubId, TRANSPORT_WIFI, uid, expectUidsPresent = true)
             }
-            doTestAllowedUidsWithSubId(defaultSubId, TRANSPORT_BLUETOOTH, uid,
-                    expectUidsPresent = false)
-            doTestAllowedUidsWithSubId(defaultSubId, intArrayOf(TRANSPORT_CELLULAR, TRANSPORT_WIFI),
-                    uid, expectUidsPresent = false)
-        } cleanupStep {
-            if (SdkLevel.isAtLeastU()) setCarrierServicePackageOverride(defaultSubId, null)
-        } cleanup {
-            if (SdkLevel.isAtLeastU()) dropCarrierPrivilege(defaultSubId)
+            doTestAllowedUidsWithSubId(
+                defaultSubId,
+                TRANSPORT_BLUETOOTH,
+                uid,
+                    expectUidsPresent = false
+            )
+            doTestAllowedUidsWithSubId(
+                defaultSubId,
+                intArrayOf(TRANSPORT_CELLULAR, TRANSPORT_WIFI),
+                    uid,
+                expectUidsPresent = false
+            )
         }
     }
 
@@ -910,8 +876,10 @@ class NetworkAgentTest {
         // If using the int ranking, agent1 must be upgraded to a better score so that there is
         // no ambiguity when agent2 connects that agent1 is still better. If using policy
         // ranking, this is not necessary.
-        agent1.sendNetworkScore(NetworkScore.Builder().setLegacyInt(BETTER_NETWORK_SCORE)
-                .build())
+        agent1.sendNetworkScore(
+            NetworkScore.Builder().setLegacyInt(BETTER_NETWORK_SCORE)
+                .build()
+        )
 
         // Connect the second agent.
         val (agent2, _) = createConnectedNetworkAgent()
@@ -920,10 +888,12 @@ class NetworkAgentTest {
         // virtue of already satisfying the request.
         callback.assertNoCallback(NO_CALLBACK_TIMEOUT)
         // Now downgrade the score and expect the callback now prefers agent2
-        agent1.sendNetworkScore(NetworkScore.Builder()
+        agent1.sendNetworkScore(
+            NetworkScore.Builder()
                 .setLegacyInt(WORSE_NETWORK_SCORE)
                 .setExiting(true)
-                .build())
+                .build()
+        )
         callback.expect<Available>(agent2.network!!)
 
         // tearDown() will unregister the requests and agents
@@ -968,16 +938,20 @@ class NetworkAgentTest {
         // Check that the default network's transport is propagated to the VPN.
         var vpnNc = mCM.getNetworkCapabilities(agent.network!!)
         assertNotNull(vpnNc)
-        assertEquals(VpnManager.TYPE_VPN_SERVICE,
-                (vpnNc.transportInfo as VpnTransportInfo).type)
+        assertEquals(
+            VpnManager.TYPE_VPN_SERVICE,
+            (vpnNc.transportInfo as VpnTransportInfo).type
+        )
         assertEquals(mySessionId, (vpnNc.transportInfo as VpnTransportInfo).sessionId)
 
         val testAndVpn = intArrayOf(TRANSPORT_TEST, TRANSPORT_VPN)
         assertTrue(vpnNc.hasAllTransports(testAndVpn))
         assertFalse(vpnNc.hasCapability(NET_CAPABILITY_NOT_VPN))
-        assertTrue(vpnNc.hasAllTransports(defaultNetworkTransports),
-                "VPN transports ${Arrays.toString(vpnNc.transportTypes)}" +
-                        " lacking transports from ${Arrays.toString(defaultNetworkTransports)}")
+        assertTrue(
+            vpnNc.hasAllTransports(defaultNetworkTransports),
+            "VPN transports ${Arrays.toString(vpnNc.transportTypes)}" +
+                    " lacking transports from ${Arrays.toString(defaultNetworkTransports)}"
+        )
 
         // Check that when no underlying networks are announced the underlying transport disappears.
         agent.setUnderlyingNetworks(listOf<Network>())
@@ -999,9 +973,11 @@ class NetworkAgentTest {
         // underlying networks, and because not congested, not roaming, and not suspended are the
         // default anyway. It's still useful as an extra check though.
         vpnNc = mCM.getNetworkCapabilities(agent.network!!)!!
-        for (cap in listOf(NET_CAPABILITY_NOT_CONGESTED,
-                NET_CAPABILITY_NOT_ROAMING,
-                NET_CAPABILITY_NOT_SUSPENDED)) {
+        for (cap in listOf(
+            NET_CAPABILITY_NOT_CONGESTED,
+            NET_CAPABILITY_NOT_ROAMING,
+            NET_CAPABILITY_NOT_SUSPENDED
+        )) {
             val capStr = valueToString(NetworkCapabilities::class.java, "NET_CAPABILITY_", cap)
             if (defaultNetworkCapabilities.hasCapability(cap) && !vpnNc.hasCapability(cap)) {
                 fail("$capStr not propagated from underlying: $defaultNetworkCapabilities")
@@ -1010,6 +986,47 @@ class NetworkAgentTest {
 
         unregister(agent)
         callback.expect<Lost>(agent.network!!)
+    }
+
+    fun doTestOemVpnType(type: Int) {
+        val mySessionId = "MySession12345"
+        val nc = NetworkCapabilities().apply {
+            addTransportType(TRANSPORT_TEST)
+            addTransportType(TRANSPORT_VPN)
+            addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
+            removeCapability(NET_CAPABILITY_NOT_VPN)
+            setTransportInfo(VpnTransportInfo(type, mySessionId))
+        }
+
+        val agent = createNetworkAgent(initialNc = nc)
+        agent.register()
+        agent.markConnected()
+
+        val request = NetworkRequest.Builder()
+            .clearCapabilities()
+            .addTransportType(TRANSPORT_VPN)
+            .removeCapability(NET_CAPABILITY_NOT_VPN)
+            .build()
+        val callback = TestableNetworkCallback()
+        registerNetworkCallback(request, callback)
+
+        callback.expectAvailableThenValidatedCallbacks(agent.network!!)
+
+        var vpnNc = mCM.getNetworkCapabilities(agent.network!!)
+        assertNotNull(vpnNc)
+        assertEquals(type, (vpnNc!!.transportInfo as VpnTransportInfo).type)
+
+        agent.unregister()
+        callback.expect<Lost>(agent.network!!)
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    fun testOemVpnTypes() {
+        // TODO: why is this necessary given the @IgnoreUpTo above?
+        assumeTrue(SdkLevel.isAtLeastB())
+        doTestOemVpnType(VpnManager.TYPE_VPN_OEM_SERVICE)
+        doTestOemVpnType(VpnManager.TYPE_VPN_OEM_LEGACY)
     }
 
     private fun unregister(agent: TestableNetworkAgent) {
@@ -1023,16 +1040,37 @@ class NetworkAgentTest {
     fun testAgentStartsInConnecting() {
         val mockContext = mock(Context::class.java)
         val mockCm = mock(ConnectivityManager::class.java)
+        val mockedResult = ConnectivityManager.MockHelpers.registerNetworkAgentResult(
+            mock(Network::class.java),
+            mock(INetworkAgentRegistry::class.java)
+        )
+        doReturn(SHOULD_CREATE_NETWORKS_IMMEDIATELY).`when`(mockCm)
+            .isFeatureEnabled(
+                eq(ConnectivityManager.FEATURE_QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER)
+            )
+        doReturn(Context.CONNECTIVITY_SERVICE).`when`(mockContext)
+            .getSystemServiceName(ConnectivityManager::class.java)
         doReturn(mockCm).`when`(mockContext).getSystemService(Context.CONNECTIVITY_SERVICE)
+        doReturn(mockedResult).`when`(mockCm).registerNetworkAgent(
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            any(),
+            anyInt()
+        )
         val agent = createNetworkAgent(mockContext)
         agent.register()
-        verify(mockCm).registerNetworkAgent(any(),
-                argThat<NetworkInfo> { it.detailedState == NetworkInfo.DetailedState.CONNECTING },
-                any(LinkProperties::class.java),
-                any(NetworkCapabilities::class.java),
-                any(NetworkScore::class.java),
-                any(NetworkAgentConfig::class.java),
-                eq(NetworkProvider.ID_NONE))
+        verify(mockCm).registerNetworkAgent(
+            any(),
+            argThat<NetworkInfo> { it.detailedState == NetworkInfo.DetailedState.CONNECTING },
+            any(LinkProperties::class.java),
+            any(NetworkCapabilities::class.java),
+            any(NetworkScore::class.java),
+            any(NetworkAgentConfig::class.java),
+            eq(NetworkProvider.ID_NONE)
+        )
     }
 
     @Test
@@ -1079,8 +1117,10 @@ class NetworkAgentTest {
     @Test
     fun testValidationStatus() = createNetworkAgentWithFakeCS().let { agent ->
         val uri = Uri.parse("http://www.google.com")
-        mFakeConnectivityService.agent.onValidationStatusChanged(VALID_NETWORK,
-                uri.toString())
+        mFakeConnectivityService.agent.onValidationStatusChanged(
+            VALID_NETWORK,
+            uri.toString()
+        )
         agent.expectCallback<OnValidationStatus>().let {
             assertEquals(it.status, VALID_NETWORK)
             assertEquals(it.uri, uri)
@@ -1155,7 +1195,8 @@ class NetworkAgentTest {
         }
         assertFailsWith<IllegalArgumentException> {
             agentWeaker.setLingerDuration(Duration.ofMillis(
-                    NetworkAgent.MIN_LINGER_TIMER_MS.toLong() - 1))
+                    NetworkAgent.MIN_LINGER_TIMER_MS.toLong() - 1
+            ))
         }
         // Verify valid linger timer can be set, but it should not take effect since the network
         // is still needed.
@@ -1165,11 +1206,14 @@ class NetworkAgentTest {
         agentWeaker.setLingerDuration(Duration.ofMillis(NetworkAgent.MIN_LINGER_TIMER_MS.toLong()))
         // Make a listener which can observe agentWeaker lost later.
         val callbackWeaker = TestableNetworkCallback(timeoutMs = DEFAULT_TIMEOUT_MS)
-        registerNetworkCallback(NetworkRequest.Builder()
+        registerNetworkCallback(
+            NetworkRequest.Builder()
                 .clearCapabilities()
                 .addTransportType(TRANSPORT_TEST)
                 .setNetworkSpecifier(CompatUtil.makeEthernetNetworkSpecifier(specifierWeaker))
-                .build(), callbackWeaker)
+                .build(),
+            callbackWeaker
+        )
         callbackWeaker.expectAvailableCallbacks(agentWeaker.network!!)
 
         // Connect the agentStronger with a score better than agentWeaker. Verify the callback for
@@ -1186,8 +1230,10 @@ class NetworkAgentTest {
         val expectedRemainingLingerDuration = lingerStart +
                 NetworkAgent.MIN_LINGER_TIMER_MS.toLong() - SystemClock.elapsedRealtime()
         // If the available callback is too late. The remaining duration will be reduced.
-        assertTrue(expectedRemainingLingerDuration > 0,
-                "expected remaining linger duration is $expectedRemainingLingerDuration")
+        assertTrue(
+            expectedRemainingLingerDuration > 0,
+            "expected remaining linger duration is $expectedRemainingLingerDuration"
+        )
         callbackWeaker.assertNoCallback(expectedRemainingLingerDuration)
         callbackWeaker.expect<Lost>(agentWeaker.network!!)
     }
@@ -1205,20 +1251,24 @@ class NetworkAgentTest {
         assertEquals(imsi, testNetworkSnapshot!!.subscriberId)
     }
 
-    @Test
-    @IgnoreUpTo(Build.VERSION_CODES.R)
     // TODO: Refactor helper functions to util class and move this test case to
     //  {@link android.net.cts.ConnectivityManagerTest}.
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.R)
     fun testRegisterBestMatchingNetworkCallback() {
         // Register best matching network callback with additional condition that will be
         // exercised later. This assumes the test network agent has NOT_VCN_MANAGED in it and
         // does not have NET_CAPABILITY_TEMPORARILY_NOT_METERED.
         val bestMatchingCb = TestableNetworkCallback(timeoutMs = DEFAULT_TIMEOUT_MS)
-        registerBestMatchingNetworkCallback(NetworkRequest.Builder()
+        registerBestMatchingNetworkCallback(
+            NetworkRequest.Builder()
                 .clearCapabilities()
                 .addTransportType(TRANSPORT_TEST)
                 .addCapability(NET_CAPABILITY_NOT_VCN_MANAGED)
-                .build(), bestMatchingCb, mHandlerThread.threadHandler)
+                .build(),
+            bestMatchingCb,
+            mHandlerThread.threadHandler
+        )
 
         val (agent1, _) = createConnectedNetworkAgent(specifier = "AGENT-1")
         bestMatchingCb.expectAvailableThenValidatedCallbacks(agent1.network!!)
@@ -1296,8 +1346,10 @@ class NetworkAgentTest {
         }
 
         fun assertNoCallback() {
-            assertNull(history.poll(NO_CALLBACK_TIMEOUT),
-                    "Callback received")
+            assertNull(
+                history.poll(NO_CALLBACK_TIMEOUT),
+                "Callback received"
+            )
         }
     }
 
@@ -1312,7 +1364,8 @@ class NetworkAgentTest {
 
     private fun setupForQosDatagram() = setupForQosCallbackTest {
         agent: TestableNetworkAgent -> DatagramSocket(
-            InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
+            InetSocketAddress(InetAddress.getLoopbackAddress(), 0)
+        )
             .also { assertNotNull(agent.network?.bindSocket(it)) }
     }
 
@@ -1345,7 +1398,8 @@ class NetworkAgentTest {
 
                 assertFailsWith<QosCallbackRegistrationException>(
                         "The same callback cannot be " +
-                        "registered more than once without first being unregistered") {
+                        "registered more than once without first being unregistered"
+                ) {
                     mCM.registerQosCallback(info, executor, qosCallback)
                 }
             } finally {
@@ -1438,8 +1492,10 @@ class NetworkAgentTest {
                 qosCallback.expectCallback<OnQosSessionAvailable>()
 
                 // Check that onError is coming through correctly
-                agent.sendQosCallbackError(callbackId,
-                        QosCallbackException.EX_TYPE_FILTER_NOT_SUPPORTED)
+                agent.sendQosCallbackError(
+                    callbackId,
+                    QosCallbackException.EX_TYPE_FILTER_NOT_SUPPORTED
+                )
                 qosCallback.expectCallback<OnError> {
                     it.ex.cause is UnsupportedOperationException
                 }
@@ -1534,17 +1590,24 @@ class NetworkAgentTest {
         val remoteAddresses = ArrayList<InetSocketAddress>()
         remoteAddresses.add(InetSocketAddress(REMOTE_ADDRESS, 80))
         return EpsBearerQosSessionAttributes(
-                qci, 2, 3, 4, 5,
-                remoteAddresses
+            qci,
+            2,
+            3,
+            4,
+            5,
+            remoteAddresses
         )
     }
 
-    fun sendAndExpectUdpPacket(net: Network,
-                               reader: PollPacketReader, iface: TestNetworkInterface) {
+    fun sendAndExpectUdpPacket(
+        net: Network,
+        reader: PollPacketReader,
+        iface: TestNetworkInterface
+    ) {
         val s = Os.socket(AF_INET6, SOCK_DGRAM, 0)
         net.bindSocket(s)
         val content = ByteArray(16)
-        Random().nextBytes(content)
+        Random.nextBytes(content)
         Os.sendto(s, ByteBuffer.wrap(content), 0, REMOTE_ADDRESS, 7 /* port */)
         val match = reader.poll(DEFAULT_TIMEOUT_MS) {
             val udpStart = IPV6_HEADER_LEN + UDP_HEADER_LEN
@@ -1553,8 +1616,11 @@ class NetworkAgentTest {
                     it[IPV6_PROTOCOL_OFFSET].toInt() == IPPROTO_UDP &&
                     Arrays.equals(content, it.copyOfRange(udpStart, udpStart + content.size))
         }
-        assertNotNull(match, "Did not receive matching packet on ${iface.interfaceName} " +
-                " after ${DEFAULT_TIMEOUT_MS}ms")
+        assertNotNull(
+            match,
+            "Did not receive matching packet on ${iface.interfaceName} " +
+                " after ${DEFAULT_TIMEOUT_MS}ms"
+        )
     }
 
     fun createInterfaceAndReader(): Triple<TestNetworkInterface, PollPacketReader, LinkProperties> {
@@ -1639,16 +1705,25 @@ class NetworkAgentTest {
 
         // Connect a third network. Because network1 is awaiting replacement, network3 is preferred
         // as soon as it validates (until then, it is outscored by network1).
-        // The fact that the first events seen by matchAllCallback is the connection of network3
+        // The fact that the first event seen by matchAllCallback is the connection of network3
         // implicitly ensures that no callbacks are sent since network1 was lost.
         val (agent3, network3) = connectNetwork(lp = lp)
-        matchAllCallback.expectAvailableThenValidatedCallbacks(network3)
-        testCallback.expectAvailableDoubleValidatedCallbacks(network3)
-        sendAndExpectUdpPacket(network3, reader, iface)
-
-        // As soon as the replacement arrives, network1 is disconnected.
-        // Check that this happens before the replacement timeout (5 seconds) fires.
-        matchAllCallback.expect<Lost>(network1, 2_000 /* timeoutMs */)
+        if (SHOULD_CREATE_NETWORKS_IMMEDIATELY) {
+            // This is the correct sequence of events.
+            matchAllCallback.expectAvailableCallbacks(network3, validated = false)
+            matchAllCallback.expect<Lost>(network1, 2_000 /* timeoutMs */)
+            matchAllCallback.expectCaps(network3) { it.hasCapability(NET_CAPABILITY_VALIDATED) }
+            sendAndExpectUdpPacket(network3, reader, iface)
+            testCallback.expectAvailableDoubleValidatedCallbacks(network3)
+        } else {
+            // This is incorrect and fixed by the "create networks immediately" feature
+            matchAllCallback.expectAvailableThenValidatedCallbacks(network3)
+            testCallback.expectAvailableDoubleValidatedCallbacks(network3)
+            sendAndExpectUdpPacket(network3, reader, iface)
+            // As soon as the replacement arrives, network1 is disconnected.
+            // Check that this happens before the replacement timeout (5 seconds) fires.
+            matchAllCallback.expect<Lost>(network1, 2_000 /* timeoutMs */)
+        }
         agent1.expectCallback<OnNetworkUnwanted>()
 
         // Test lingering:
@@ -1696,7 +1771,7 @@ class NetworkAgentTest {
         val callback = TestableNetworkCallback()
         requestNetwork(makeTestNetworkRequest(specifier = specifier6), callback)
         val agent6 = createNetworkAgent(specifier = specifier6)
-        val network6 = agent6.register()
+        agent6.register()
         if (SHOULD_CREATE_NETWORKS_IMMEDIATELY) {
             agent6.expectCallback<OnNetworkCreated>()
         } else {
@@ -1750,8 +1825,10 @@ class NetworkAgentTest {
         assertNotNull(wifiSpecifier)
         assertTrue(wifiSpecifier is EthernetNetworkSpecifier)
 
-        val wifiNc = makeTestNetworkCapabilities(wifiSpecifier.interfaceName,
-                intArrayOf(TRANSPORT_WIFI))
+        val wifiNc = makeTestNetworkCapabilities(
+            wifiSpecifier.interfaceName,
+            intArrayOf(TRANSPORT_WIFI)
+        )
         wifiAgent.sendNetworkCapabilities(wifiNc)
         val wifiLp = mCM.getLinkProperties(wifiNetwork)!!
         val newRoute = RouteInfo(IpPrefix("192.0.2.42/24"))
@@ -1764,8 +1841,19 @@ class NetworkAgentTest {
 
         val (newWifiAgent, newWifiNetwork) = connectNetwork(TRANSPORT_WIFI)
         testCallback.expectAvailableCallbacks(newWifiNetwork, validated = true)
-        matchAllCallback.expectAvailableThenValidatedCallbacks(newWifiNetwork)
-        matchAllCallback.expect<Lost>(wifiNetwork)
+        if (SHOULD_CREATE_NETWORKS_IMMEDIATELY) {
+            // This is the correct sequence of events
+            matchAllCallback.expectAvailableCallbacks(newWifiNetwork, validated = false)
+            matchAllCallback.expect<Lost>(wifiNetwork)
+            matchAllCallback.expectCaps(newWifiNetwork) {
+                it.hasCapability(NET_CAPABILITY_VALIDATED)
+            }
+        } else {
+            // When networks are not created immediately, the sequence is slightly incorrect
+            // and instead is as follows
+            matchAllCallback.expectAvailableThenValidatedCallbacks(newWifiNetwork)
+            matchAllCallback.expect<Lost>(wifiNetwork)
+        }
         wifiAgent.expectCallback<OnNetworkUnwanted>()
         testCallback.expect<CapabilitiesChanged>(newWifiNetwork)
 
@@ -1822,8 +1910,14 @@ class NetworkAgentTest {
         val nc = makeTestNetworkCapabilities(ifName, transports).also {
             if (transports.contains(TRANSPORT_VPN)) {
                 val sessionId = "NetworkAgentTest-${Process.myPid()}"
-                it.setTransportInfo(VpnTransportInfo(VpnManager.TYPE_VPN_PLATFORM, sessionId,
-                    /*bypassable=*/ false, /*longLivedTcpConnectionsExpensive=*/ false))
+                it.setTransportInfo(VpnTransportInfo(
+                    VpnManager.TYPE_VPN_PLATFORM,
+                    sessionId,
+                    /*bypassable=*/
+                    false,
+                    /*longLivedTcpConnectionsExpensive=*/
+                    false
+                ))
                 it.underlyingNetworks = listOf()
             }
         }
@@ -1868,9 +1962,11 @@ class NetworkAgentTest {
         listenCallback.expect<Available>(network)
 
         requestCallback.expect<CapabilitiesChanged>(network) { it.caps.hasCapability(
-            NET_CAPABILITY_TEMPORARILY_NOT_METERED) }
+            NET_CAPABILITY_TEMPORARILY_NOT_METERED
+        ) }
         listenCallback.expect<CapabilitiesChanged>(network) { it.caps.hasCapability(
-            NET_CAPABILITY_TEMPORARILY_NOT_METERED) }
+            NET_CAPABILITY_TEMPORARILY_NOT_METERED
+        ) }
 
         requestCallback.expect<LinkPropertiesChanged>(network) { it.lp.equals(lp) }
         listenCallback.expect<LinkPropertiesChanged>(network) { it.lp.equals(lp) }
@@ -1896,7 +1992,8 @@ class NetworkAgentTest {
     fun testNativeNetworkCreation_PhysicalNetwork() {
         doTestNativeNetworkCreation(
                 expectCreatedImmediately = SHOULD_CREATE_NETWORKS_IMMEDIATELY,
-                intArrayOf(TRANSPORT_CELLULAR))
+                intArrayOf(TRANSPORT_CELLULAR)
+        )
     }
 
     @Test
@@ -1904,26 +2001,19 @@ class NetworkAgentTest {
         // VPN networks are always created as soon as the agent is registered.
         doTestNativeNetworkCreation(expectCreatedImmediately = true, intArrayOf(TRANSPORT_VPN))
     }
-}
 
-// Subclasses of CarrierPrivilegesCallback can't be inline, or they'll be compiled as
-// inner classes of the test class and will fail resolution on R as the test harness
-// uses reflection to list all methods and classes
-class PrivilegeWaiterCallback(private val cv: ConditionVariable) :
-        CarrierPrivilegesCallback {
-    var hasPrivilege = false
-    override fun onCarrierPrivilegesChanged(p: MutableSet<String>, uids: MutableSet<Int>) {
-        hasPrivilege = uids.contains(Process.myUid())
-        cv.open()
+    @Test(expected = IllegalStateException::class)
+    fun testRegisterAgain() {
+        val agent = createNetworkAgent()
+        agent.register()
+        agent.unregister()
+        agent.register()
     }
-}
 
-class CarrierServiceChangedWaiterCallback(private val cv: ConditionVariable) :
-        CarrierPrivilegesCallback {
-    var pkgName: String? = null
-    override fun onCarrierPrivilegesChanged(p: MutableSet<String>, u: MutableSet<Int>) {}
-    override fun onCarrierServiceChanged(pkgName: String?, uid: Int) {
-        this.pkgName = pkgName
-        cv.open()
+    @Test
+    fun testUnregisterBeforeRegister() {
+        // For backward compatibility, this shouldn't crash.
+        val agent = createNetworkAgent()
+        agent.unregister()
     }
 }

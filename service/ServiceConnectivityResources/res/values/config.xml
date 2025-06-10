@@ -135,6 +135,15 @@
     <string-array translatable="false" name="config_nsdOffloadServicesPriority">
     </string-array>
 
+    <!-- An array of service types that shouldn't be offloaded via NsdManager#registerOffloadEngine.
+         Format is [service type], for example: "_testservice._tcp"
+         Due to limited RAM in hardware offload, we prioritize user-impacting services.
+         _googlezone._tcp, an internal Googlecast service, was therefore blocked.
+    -->
+    <string-array name="config_nsdOffloadServicesDenyList" translatable="false">
+        <item>_googlezone._tcp</item>
+    </string-array>
+
     <!-- Whether to use an ongoing notification for signing in to captive portals, instead of a
          notification that can be dismissed. -->
     <bool name="config_ongoingSignInNotification">false</bool>
@@ -184,6 +193,8 @@
                    The NOT_ROAMING, NOT_CONGESTED and NOT_SUSPENDED capabilities are always
                    added automatically because this configuration provides no way to update
                    them dynamically.
+                   On Android B+, a "*" string configures the same default capabilities as is
+                   used for interfaces without any explicit configuration.
                [IP config] Optional. If empty or not specified - DHCP will be used, otherwise
                    use the following format to specify static IP configuration:
                        ip=<ip-address/mask> gateway=<ip-address> dns=<comma-sep-ip-addresses>

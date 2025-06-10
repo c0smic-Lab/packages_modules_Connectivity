@@ -22,7 +22,6 @@
 #include <inttypes.h>
 
 #include <android-base/unique_fd.h>
-#include <android-modules-utils/sdk_level.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <log/log.h>
 #include <netdutils/UidConstants.h>
@@ -36,6 +35,12 @@ namespace net {
 using base::unique_fd;
 using base::WaitForProperty;
 using bpf::getSocketCookie;
+using bpf::isAtLeastKernelVersion;
+using bpf::isAtLeastT;
+using bpf::isAtLeastU;
+using bpf::isAtLeastV;
+using bpf::isAtLeast25Q2;
+using bpf::queryProgram;
 using bpf::retrieveProgram;
 using netdutils::Status;
 using netdutils::statusFromErrno;
@@ -56,7 +61,7 @@ static Status attachProgramToCgroup(const char* programPath, const unique_fd& cg
     if (!cgroupProg.ok()) {
         return statusFromErrno(errno, fmt::format("Failed to get program from {}", programPath));
     }
-    if (android::bpf::attachProgram(type, cgroupProg, cgroupFd)) {
+    if (bpf::attachProgram(type, cgroupProg, cgroupFd)) {
         return statusFromErrno(errno, fmt::format("Program {} attach failed", programPath));
     }
     return netdutils::status::ok;
@@ -74,19 +79,25 @@ static Status initPrograms(const char* cg2_path) {
     if (!cg2_path) return Status("cg2_path is NULL");
 
     // This code was mainlined in T, so this should be trivially satisfied.
-    if (!modules::sdklevel::IsAtLeastT()) return Status("S- platform is unsupported");
+    if (!isAtLeastT) return Status("S- platform is unsupported");
 
     // U mandates this mount point (though it should also be the case on T)
-    if (modules::sdklevel::IsAtLeastU() && !!strcmp(cg2_path, "/sys/fs/cgroup")) {
+    if (isAtLeastU && !!strcmp(cg2_path, "/sys/fs/cgroup")) {
         return Status("U+ platform with cg2_path != /sys/fs/cgroup is unsupported");
     }
 
-    unique_fd cg_fd(open(cg2_path, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
-    if (!cg_fd.ok()) {
-        const int err = errno;
-        ALOGE("Failed to open the cgroup directory: %s", strerror(err));
-        return statusFromErrno(err, "Open the cgroup directory failed");
+    // V bumps the kernel requirement up to 4.19
+    if (isAtLeastV && !isAtLeastKernelVersion(4, 19, 0)) {
+        return Status("V+ platform with kernel version < 4.19.0 is unsupported");
     }
+
+    // 25Q2 bumps the kernel requirement up to 5.4
+    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4, 0)) {
+        return Status("25Q2+ platform with kernel version < 5.4.0 is unsupported");
+    }
+
+    unique_fd cg_fd(open(cg2_path, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
+    if (!cg_fd.ok()) return statusFromErrno(errno, "Opening cgroup dir failed");
 
     RETURN_IF_NOT_OK(checkProgramAccessible(XT_BPF_ALLOWLIST_PROG_PATH));
     RETURN_IF_NOT_OK(checkProgramAccessible(XT_BPF_DENYLIST_PROG_PATH));
@@ -100,20 +111,20 @@ static Status initPrograms(const char* cg2_path) {
     // cgroup if the program is pinned properly.
     // TODO: delete the if statement once all devices should support cgroup
     // socket filter (ie. the minimum kernel version required is 4.14).
-    if (bpf::isAtLeastKernelVersion(4, 14, 0)) {
+    if (isAtLeastKernelVersion(4, 14, 0)) {
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_INET_CREATE_PROG_PATH,
                                     cg_fd, BPF_CGROUP_INET_SOCK_CREATE));
     }
 
-    if (bpf::isAtLeastKernelVersion(5, 10, 0)) {
+    if (isAtLeastKernelVersion(5, 10, 0)) {
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_INET_RELEASE_PROG_PATH,
                                     cg_fd, BPF_CGROUP_INET_SOCK_RELEASE));
     }
 
-    if (modules::sdklevel::IsAtLeastV()) {
+    if (isAtLeastV) {
         // V requires 4.19+, so technically this 2nd 'if' is not required, but it
         // doesn't hurt us to try to support AOSP forks that try to support older kernels.
-        if (bpf::isAtLeastKernelVersion(4, 19, 0)) {
+        if (isAtLeastKernelVersion(4, 19, 0)) {
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_CONNECT4_PROG_PATH,
                                         cg_fd, BPF_CGROUP_INET4_CONNECT));
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_CONNECT6_PROG_PATH,
@@ -128,7 +139,7 @@ static Status initPrograms(const char* cg2_path) {
                                         cg_fd, BPF_CGROUP_UDP6_SENDMSG));
         }
 
-        if (bpf::isAtLeastKernelVersion(5, 4, 0)) {
+        if (isAtLeastKernelVersion(5, 4, 0)) {
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_GETSOCKOPT_PROG_PATH,
                                         cg_fd, BPF_CGROUP_GETSOCKOPT));
             RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_SETSOCKOPT_PROG_PATH,
@@ -136,7 +147,7 @@ static Status initPrograms(const char* cg2_path) {
         }
     }
 
-    if (bpf::isAtLeastKernelVersion(4, 19, 0)) {
+    if (isAtLeastKernelVersion(4, 19, 0)) {
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_BIND4_PROG_PATH,
                 cg_fd, BPF_CGROUP_INET4_BIND));
         RETURN_IF_NOT_OK(attachProgramToCgroup(CGROUP_BIND6_PROG_PATH,
@@ -144,32 +155,32 @@ static Status initPrograms(const char* cg2_path) {
 
         // This should trivially pass, since we just attached up above,
         // but BPF_PROG_QUERY is only implemented on 4.19+ kernels.
-        if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET_EGRESS) <= 0) abort();
-        if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET_INGRESS) <= 0) abort();
-        if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET_SOCK_CREATE) <= 0) abort();
-        if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET4_BIND) <= 0) abort();
-        if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET6_BIND) <= 0) abort();
+        if (queryProgram(cg_fd, BPF_CGROUP_INET_EGRESS) <= 0) abort();
+        if (queryProgram(cg_fd, BPF_CGROUP_INET_INGRESS) <= 0) abort();
+        if (queryProgram(cg_fd, BPF_CGROUP_INET_SOCK_CREATE) <= 0) abort();
+        if (queryProgram(cg_fd, BPF_CGROUP_INET4_BIND) <= 0) abort();
+        if (queryProgram(cg_fd, BPF_CGROUP_INET6_BIND) <= 0) abort();
     }
 
-    if (bpf::isAtLeastKernelVersion(5, 10, 0)) {
-        if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET_SOCK_RELEASE) <= 0) abort();
+    if (isAtLeastKernelVersion(5, 10, 0)) {
+        if (queryProgram(cg_fd, BPF_CGROUP_INET_SOCK_RELEASE) <= 0) abort();
     }
 
-    if (modules::sdklevel::IsAtLeastV()) {
+    if (isAtLeastV) {
         // V requires 4.19+, so technically this 2nd 'if' is not required, but it
         // doesn't hurt us to try to support AOSP forks that try to support older kernels.
-        if (bpf::isAtLeastKernelVersion(4, 19, 0)) {
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET4_CONNECT) <= 0) abort();
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_INET6_CONNECT) <= 0) abort();
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_UDP4_RECVMSG) <= 0) abort();
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_UDP6_RECVMSG) <= 0) abort();
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_UDP4_SENDMSG) <= 0) abort();
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_UDP6_SENDMSG) <= 0) abort();
+        if (isAtLeastKernelVersion(4, 19, 0)) {
+            if (queryProgram(cg_fd, BPF_CGROUP_INET4_CONNECT) <= 0) abort();
+            if (queryProgram(cg_fd, BPF_CGROUP_INET6_CONNECT) <= 0) abort();
+            if (queryProgram(cg_fd, BPF_CGROUP_UDP4_RECVMSG) <= 0) abort();
+            if (queryProgram(cg_fd, BPF_CGROUP_UDP6_RECVMSG) <= 0) abort();
+            if (queryProgram(cg_fd, BPF_CGROUP_UDP4_SENDMSG) <= 0) abort();
+            if (queryProgram(cg_fd, BPF_CGROUP_UDP6_SENDMSG) <= 0) abort();
         }
 
-        if (bpf::isAtLeastKernelVersion(5, 4, 0)) {
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_GETSOCKOPT) <= 0) abort();
-            if (bpf::queryProgram(cg_fd, BPF_CGROUP_SETSOCKOPT) <= 0) abort();
+        if (isAtLeastKernelVersion(5, 4, 0)) {
+            if (queryProgram(cg_fd, BPF_CGROUP_GETSOCKOPT) <= 0) abort();
+            if (queryProgram(cg_fd, BPF_CGROUP_SETSOCKOPT) <= 0) abort();
         }
     }
 
@@ -209,7 +220,7 @@ static inline void waitForBpf() {
         // but there could be platform provided (xt_)bpf programs that oem/vendor
         // modified netd (which calls us during init) depends on...
         ALOGI("Waiting for platform BPF programs");
-        android::bpf::waitForProgsLoaded();
+        bpf::waitForProgsLoaded();
     }
 
     if (!mainlineNetBpfLoadDone()) {
@@ -241,11 +252,30 @@ Status BpfHandler::init(const char* cg2_path) {
     // ...unless someone changed 'exec_start bpfloader' to 'start bpfloader'
     // in the rc file.
     //
-    // TODO: should be: if (!modules::sdklevel::IsAtLeastW())
-    if (android_get_device_api_level() <= __ANDROID_API_V__) waitForBpf();
+    if (!isAtLeast25Q2) waitForBpf();
 
     RETURN_IF_NOT_OK(initPrograms(cg2_path));
     RETURN_IF_NOT_OK(initMaps());
+
+    if (isAtLeast25Q2) {
+        struct rlimit limit = {
+            .rlim_cur = 1u << 30,  // 1 GiB
+            .rlim_max = 1u << 30,  // 1 GiB
+        };
+        // 25Q2 netd.rc includes "rlimit memlock 1073741824 1073741824"
+        // so this should be a no-op, and thus just succeed.
+        // make sure it isn't lowered in platform netd.rc...
+        if (setrlimit(RLIMIT_MEMLOCK, &limit))
+            return statusFromErrno(errno, "Failed to set 1GiB RLIMIT_MEMLOCK");
+
+        // Make sure netd can create & write maps.  sepolicy is V+, but enough to enforce on 25Q2+
+        int key = 1;
+        int value = 123;
+        unique_fd map(bpf::createMap(BPF_MAP_TYPE_ARRAY, sizeof(key), sizeof(value), 2, 0));
+        if (!map.ok()) return statusFromErrno(errno, fmt::format("map create failed"));
+        int rv = bpf::writeToMapEntry(map, &key, &value, BPF_ANY);
+        if (rv) return statusFromErrno(errno, fmt::format("map write failed (rv={})", rv));
+    }
 
     return netdutils::status::ok;
 }
@@ -273,7 +303,7 @@ static void mapLockTest(void) {
 
 Status BpfHandler::initMaps() {
     // bpfLock() requires bpfGetFdMapId which is only available on 4.14+ kernels.
-    if (bpf::isAtLeastKernelVersion(4, 14, 0)) {
+    if (isAtLeastKernelVersion(4, 14, 0)) {
         mapLockTest();
     }
 
@@ -283,7 +313,6 @@ Status BpfHandler::initMaps() {
     RETURN_IF_NOT_OK(mUidPermissionMap.init(UID_PERMISSION_MAP_PATH));
     // initialized last so mCookieTagMap.isValid() implies everything else is valid too
     RETURN_IF_NOT_OK(mCookieTagMap.init(COOKIE_TAG_MAP_PATH));
-    ALOGI("%s successfully", __func__);
 
     return netdutils::status::ok;
 }
@@ -312,8 +341,8 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
     if (chargeUid == AID_CLAT) return -EPERM;
 
     // The socket destroy listener only monitors on the group {INET_TCP, INET_UDP, INET6_TCP,
-    // INET6_UDP}. Tagging listener unsupported socket causes that the tag can't be removed from
-    // tag map automatically. Eventually, the tag map may run out of space because of dead tag
+    // INET6_UDP}. Tagging listener unsupported sockets (on <5.10) means the tag cannot be
+    // removed from tag map automatically. Eventually, it may run out of space due to dead tag
     // entries. Note that although tagSocket() of net client has already denied the family which
     // is neither AF_INET nor AF_INET6, the family validation is still added here just in case.
     // See tagSocket in system/netd/client/NetdClient.cpp and
@@ -327,19 +356,23 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
         return -errno;
     }
     if (socketFamily != AF_INET && socketFamily != AF_INET6) {
-        ALOGE("Unsupported family: %d", socketFamily);
+        ALOGV("Unsupported family: %d", socketFamily);
         return -EAFNOSUPPORT;
     }
 
-    int socketProto;
-    socklen_t protoLen = sizeof(socketProto);
-    if (getsockopt(sockFd, SOL_SOCKET, SO_PROTOCOL, &socketProto, &protoLen)) {
-        ALOGE("Failed to getsockopt SO_PROTOCOL: %s, fd: %d", strerror(errno), sockFd);
-        return -errno;
-    }
-    if (socketProto != IPPROTO_UDP && socketProto != IPPROTO_TCP) {
-        ALOGE("Unsupported protocol: %d", socketProto);
-        return -EPROTONOSUPPORT;
+    // On 5.10+ the BPF_CGROUP_INET_SOCK_RELEASE hook takes care of cookie tag map cleanup
+    // during socket destruction. As such the socket destroy listener is superfluous.
+    if (!isAtLeastKernelVersion(5, 10, 0)) {
+        int socketProto;
+        socklen_t protoLen = sizeof(socketProto);
+        if (getsockopt(sockFd, SOL_SOCKET, SO_PROTOCOL, &socketProto, &protoLen)) {
+            ALOGE("Failed to getsockopt SO_PROTOCOL: %s, fd: %d", strerror(errno), sockFd);
+            return -errno;
+        }
+        if (socketProto != IPPROTO_UDP && socketProto != IPPROTO_TCP) {
+            ALOGV("Unsupported protocol: %d", socketProto);
+            return -EPROTONOSUPPORT;
+        }
     }
 
     uint64_t sock_cookie = getSocketCookie(sockFd);
@@ -400,8 +433,8 @@ int BpfHandler::tagSocket(int sockFd, uint32_t tag, uid_t chargeUid, uid_t realU
         ALOGE("Failed to tag the socket: %s", strerror(res.error().code()));
         return -res.error().code();
     }
-    ALOGD("Socket with cookie %" PRIu64 " tagged successfully with tag %" PRIu32 " uid %u "
-              "and real uid %u", sock_cookie, tag, chargeUid, realUid);
+    ALOGV("Socket with cookie %" PRIu64 " tagged successfully with tag %" PRIu32 " uid %u "
+          "and real uid %u", sock_cookie, tag, chargeUid, realUid);
     return 0;
 }
 
@@ -412,10 +445,11 @@ int BpfHandler::untagSocket(int sockFd) {
     if (!mCookieTagMap.isValid()) return -EPERM;
     base::Result<void> res = mCookieTagMap.deleteValue(sock_cookie);
     if (!res.ok()) {
-        ALOGE("Failed to untag socket: %s", strerror(res.error().code()));
-        return -res.error().code();
+        const int err = res.error().code();
+        if (err != ENOENT) ALOGE("Failed to untag socket: %s", strerror(err));
+        return -err;
     }
-    ALOGD("Socket with cookie %" PRIu64 " untagged successfully.", sock_cookie);
+    ALOGV("Socket with cookie %" PRIu64 " untagged successfully.", sock_cookie);
     return 0;
 }
 

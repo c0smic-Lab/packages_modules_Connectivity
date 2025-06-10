@@ -81,17 +81,6 @@ java_library {
     },
 }
 
-java_defaults {
-    name: "lib_mockito_extended",
-    static_libs: [
-        "mockito-target-extended-minus-junit4",
-    ],
-    jni_libs: [
-        "libdexmakerjvmtiagent",
-        "libstaticjvmtiagent",
-    ],
-}
-
 java_library {
     name: "net-utils-dnspacket-common",
     srcs: [
@@ -350,7 +339,7 @@ java_library {
     // TODO: remove "apex_available:platform".
     apex_available: [
         "//apex_available:platform",
-        "com.android.btservices",
+        "com.android.bt",
         "com.android.tethering",
         "com.android.wifi",
     ],

@@ -21,13 +21,15 @@ python_test_host {
     name: "CtsConnectivityMultiDevicesTestCases",
     main: "run_tests.py",
     srcs: [
-        "apfv4_test.py",
+        // "apfv4_test.py",
+        // "apfv6_test.py",
         "connectivity_multi_devices_test.py",
         "run_tests.py",
     ],
     libs: [
         "absl-py",
         "mobly",
+        "scapy",
         "net-tests-utils-host-python-common",
     ],
     test_suites: [
@@ -41,9 +43,4 @@ python_test_host {
         // Package the snippet with the mobly test
         ":connectivity_multi_devices_snippet",
     ],
-    version: {
-        py3: {
-            embedded_launcher: true,
-        },
-    },
 }

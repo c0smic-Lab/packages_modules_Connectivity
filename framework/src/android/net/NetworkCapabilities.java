@@ -359,6 +359,8 @@ public final class NetworkCapabilities implements Parcelable {
         mSubIds = new ArraySet<>();
         mUnderlyingNetworks = null;
         mEnterpriseId = 0;
+        mReservationId = RES_ID_UNSET;
+        mMatchNonThreadLocalNetworks = false;
     }
 
     /**
@@ -393,6 +395,8 @@ public final class NetworkCapabilities implements Parcelable {
         // necessary.
         mUnderlyingNetworks = nc.mUnderlyingNetworks;
         mEnterpriseId = nc.mEnterpriseId;
+        mReservationId = nc.mReservationId;
+        mMatchNonThreadLocalNetworks = nc.mMatchNonThreadLocalNetworks;
     }
 
     /**
@@ -2233,7 +2237,9 @@ public final class NetworkCapabilities implements Parcelable {
                 && (onlyImmutable || satisfiedByUids(nc))
                 && (onlyImmutable || satisfiedBySSID(nc))
                 && (onlyImmutable || satisfiedByRequestor(nc))
-                && (onlyImmutable || satisfiedBySubscriptionIds(nc)));
+                && (onlyImmutable || satisfiedBySubscriptionIds(nc)))
+                && satisfiedByReservationId(nc)
+                && satisfiedByMatchNonThreadLocalNetworks(nc);
     }
 
     /**
@@ -2347,7 +2353,9 @@ public final class NetworkCapabilities implements Parcelable {
                 && equalsAdministratorUids(that)
                 && equalsSubscriptionIds(that)
                 && equalsUnderlyingNetworks(that)
-                && equalsEnterpriseCapabilitiesId(that);
+                && equalsEnterpriseCapabilitiesId(that)
+                && equalsReservationId(that)
+                && equalsMatchNonThreadLocalNetworks(that);
     }
 
     @Override
@@ -2367,13 +2375,15 @@ public final class NetworkCapabilities implements Parcelable {
                 + Objects.hashCode(mAllowedUids) * 41
                 + Objects.hashCode(mSSID) * 43
                 + Objects.hashCode(mTransportInfo) * 47
-                + Objects.hashCode(mPrivateDnsBroken) * 53
+                + Boolean.hashCode(mPrivateDnsBroken) * 53
                 + Objects.hashCode(mRequestorUid) * 59
                 + Objects.hashCode(mRequestorPackageName) * 61
                 + Arrays.hashCode(mAdministratorUids) * 67
                 + Objects.hashCode(mSubIds) * 71
                 + Objects.hashCode(mUnderlyingNetworks) * 73
-                + mEnterpriseId * 79;
+                + mEnterpriseId * 79
+                + mReservationId * 83
+                + Boolean.hashCode(mMatchNonThreadLocalNetworks) * 89;
     }
 
     @Override
@@ -2411,6 +2421,8 @@ public final class NetworkCapabilities implements Parcelable {
         dest.writeIntArray(CollectionUtils.toIntArray(mSubIds));
         dest.writeTypedList(mUnderlyingNetworks);
         dest.writeInt(mEnterpriseId & ALL_VALID_ENTERPRISE_IDS);
+        dest.writeInt(mReservationId);
+        dest.writeBoolean(mMatchNonThreadLocalNetworks);
     }
 
     public static final @android.annotation.NonNull Creator<NetworkCapabilities> CREATOR =
@@ -2446,8 +2458,11 @@ public final class NetworkCapabilities implements Parcelable {
                 }
                 netCap.setUnderlyingNetworks(in.createTypedArrayList(Network.CREATOR));
                 netCap.mEnterpriseId = in.readInt() & ALL_VALID_ENTERPRISE_IDS;
+                netCap.mReservationId = in.readInt();
+                netCap.mMatchNonThreadLocalNetworks = in.readBoolean();
                 return netCap;
             }
+
             @Override
             public NetworkCapabilities[] newArray(int size) {
                 return new NetworkCapabilities[size];
@@ -2546,6 +2561,15 @@ public final class NetworkCapabilities implements Parcelable {
             sb.append(" EnterpriseId: ");
             appendStringRepresentationOfBitMaskToStringBuilder(sb, mEnterpriseId,
                     NetworkCapabilities::enterpriseIdNameOf, "&");
+        }
+
+        if (mReservationId != RES_ID_UNSET) {
+            final boolean isReservationOffer = (mReservationId == RES_ID_MATCH_ALL_RESERVATIONS);
+            sb.append(" ReservationId: ").append(isReservationOffer ? "*" : mReservationId);
+        }
+
+        if (mMatchNonThreadLocalNetworks) {
+            sb.append(" MatchNonThreadLocalNetworks");
         }
 
         sb.append(" UnderlyingNetworks: ");
@@ -2873,6 +2897,102 @@ public final class NetworkCapabilities implements Parcelable {
             if (mSubIds.contains(subId)) return true;
         }
         return false;
+    }
+
+    /**
+     * The reservation ID used by non-reservable Networks and "regular" NetworkOffers.
+     *
+     * Note that {@code NetworkRequest#FIRST_REQUEST_ID} is 1;
+     * @hide
+     */
+    public static final int RES_ID_UNSET = 0;
+
+    /**
+     * The reservation ID used by special NetworkOffers that handle RESERVATION requests.
+     *
+     * NetworkOffers with {@code RES_ID_MATCH_ALL_RESERVATIONS} *only* receive onNetworkNeeded()
+     * callbacks for {@code NetworkRequest.Type.RESERVATION}.
+     * @hide
+     */
+    public static final int RES_ID_MATCH_ALL_RESERVATIONS = -1;
+
+    /**
+     * Unique ID that identifies the network reservation.
+     */
+    private int mReservationId;
+
+    /**
+     * Returns the reservation ID
+     * @hide
+     */
+    public int getReservationId() {
+        return mReservationId;
+    }
+
+    /**
+     * Set the reservation ID
+     * @hide
+     */
+    public void setReservationId(int resId) {
+        mReservationId = resId;
+    }
+
+    private boolean equalsReservationId(@NonNull NetworkCapabilities nc) {
+        return mReservationId == nc.mReservationId;
+    }
+
+    private boolean satisfiedByReservationId(@NonNull NetworkCapabilities nc) {
+        if (mReservationId == RES_ID_UNSET) {
+            // To maintain regular NetworkRequest semantics, a request with a zero reservationId
+            // matches an offer or network with any reservationId except MATCH_ALL_RESERVATIONS.
+            return nc.mReservationId != RES_ID_MATCH_ALL_RESERVATIONS;
+        }
+        // A request with a non-zero reservationId matches only an offer or network with that exact
+        // reservationId (required to match the network that will eventually come up) or
+        // MATCH_ALL_RESERVATIONS (required to match the blanket reservation offer).
+        if (nc.mReservationId == RES_ID_MATCH_ALL_RESERVATIONS) {
+            return true;
+        }
+        return mReservationId == nc.mReservationId;
+    }
+
+    /**
+     * Flag to control whether a NetworkRequest can match non-thread local networks.
+     * @hide
+     */
+    private boolean mMatchNonThreadLocalNetworks;
+
+    /**
+     * Returns the match non-thread local networks flag.
+     *
+     * @hide
+     */
+    public boolean getMatchNonThreadLocalNetworks() {
+        return mMatchNonThreadLocalNetworks;
+    }
+
+    /**
+     * Set the match non-thread local networks flag.
+     * @hide
+     */
+    public void setMatchNonThreadLocalNetworks(boolean enabled) {
+        mMatchNonThreadLocalNetworks = enabled;
+    }
+
+    private boolean equalsMatchNonThreadLocalNetworks(@NonNull NetworkCapabilities nc) {
+        return mMatchNonThreadLocalNetworks == nc.mMatchNonThreadLocalNetworks;
+    }
+
+    // If the flag was set, the NetworkRequest can match all local networks.
+    // Otherwise, it can only see local networks created by Thread.
+    @SuppressWarnings("FlaggedApi")
+    private boolean satisfiedByMatchNonThreadLocalNetworks(@NonNull NetworkCapabilities nc) {
+        // If the network is not a local network, out of scope.
+        if (!nc.hasCapability(NET_CAPABILITY_LOCAL_NETWORK)) return true;
+        // If there is no restriction on matching non-thread local networks, return.
+        if (mMatchNonThreadLocalNetworks) return true;
+
+        return nc.hasTransport(TRANSPORT_THREAD);
     }
 
     /**

@@ -94,6 +94,10 @@ _Static_assert(__alignof__(enum bpf_map_type) == 4, "__alignof__ enum bpf_map_ty
 _Static_assert(_Alignof(enum bpf_map_type) == 4, "_Alignof enum bpf_map_type != 4");
 
 // Linux kernel requires sizeof(int) == 4, sizeof(void*) == sizeof(long), sizeof(long long) == 8
+_Static_assert(sizeof(int) == 4, "sizeof int != 4");
+_Static_assert(__alignof__(int) == 4, "__alignof__ int != 4");
+_Static_assert(_Alignof(int) == 4, "_Alignof int != 4");
+
 _Static_assert(sizeof(unsigned int) == 4, "sizeof unsigned int != 4");
 _Static_assert(__alignof__(unsigned int) == 4, "__alignof__ unsigned int != 4");
 _Static_assert(_Alignof(unsigned int) == 4, "_Alignof unsigned int != 4");
@@ -102,8 +106,12 @@ _Static_assert(_Alignof(unsigned int) == 4, "_Alignof unsigned int != 4");
 // Here sizeof & __alignof__ are consistent, but _Alignof is not: compile for 'aosp_cf_x86_phone'
 _Static_assert(sizeof(unsigned long long) == 8, "sizeof unsigned long long != 8");
 _Static_assert(__alignof__(unsigned long long) == 8, "__alignof__ unsigned long long != 8");
-// BPF wants 8, but 32-bit x86 wants 4
-//_Static_assert(_Alignof(unsigned long long) == 8, "_Alignof unsigned long long != 8");
+// BPF & everyone else wants 8, but 32-bit x86 wants 4
+#if defined(__i386__)
+_Static_assert(_Alignof(unsigned long long) == 4, "x86-32 _Alignof unsigned long long != 4");
+#else
+_Static_assert(_Alignof(unsigned long long) == 8, "_Alignof unsigned long long != 8");
+#endif
 
 
 // for maps:

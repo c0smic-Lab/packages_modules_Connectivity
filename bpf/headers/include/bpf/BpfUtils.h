@@ -26,12 +26,23 @@
 #include <sys/socket.h>
 #include <sys/utsname.h>
 
+#include <android-base/properties.h>
 #include <log/log.h>
 
 #include "KernelUtils.h"
 
 namespace android {
 namespace bpf {
+
+const bool unreleased = (base::GetProperty("ro.build.version.codename", "REL") != "REL");
+const int api_level = unreleased ? 10000 : android_get_device_api_level();
+const bool isAtLeastR = (api_level >= 30);
+const bool isAtLeastS = (api_level >= 31);
+// Sv2 is 32
+const bool isAtLeastT = (api_level >= 33);
+const bool isAtLeastU = (api_level >= 34);
+const bool isAtLeastV = (api_level >= 35);
+const bool isAtLeast25Q2 = (api_level >= 36);
 
 // See kernel's net/core/sock_diag.c __sock_gen_cookie()
 // the implementation of which guarantees 0 will never be returned,
@@ -63,9 +74,9 @@ static inline int synchronizeKernelRCU() {
     // 4.9 kernels. The kernel code of socket release on pf_key socket will
     // explicitly call synchronize_rcu() which is exactly what we need.
     //
-    // Linux 4.14/4.19/5.4/5.10/5.15/6.1 (and 6.3-rc5) still have this same behaviour.
+    // Linux 4.14/4.19/5.4/5.10/5.15/6.1/6.6/6.12 (& 6.13) have this behaviour.
     // see net/key/af_key.c: pfkey_release() -> synchronize_rcu()
-    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/key/af_key.c?h=v6.3-rc5#n185
+    // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/net/key/af_key.c?h=v6.13#n185
     const int pfSocket = socket(AF_KEY, SOCK_RAW | SOCK_CLOEXEC, PF_KEY_V2);
 
     if (pfSocket < 0) {

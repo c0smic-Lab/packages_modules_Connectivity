@@ -55,6 +55,7 @@ import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -82,7 +83,7 @@ public class NetlinkUtils {
     public static final int INET_DIAG_INFO = 2;
     public static final int INET_DIAG_MARK = 15;
 
-    public static final long IO_TIMEOUT_MS = 300L;
+    public static final long IO_TIMEOUT_MS = 3000L;
 
     public static final int DEFAULT_RECV_BUFSIZE = 8 * 1024;
     public static final int SOCKET_RECV_BUFSIZE = 64 * 1024;
@@ -467,6 +468,62 @@ public class NetlinkUtils {
             SocketUtils.closeSocket(fd);
         } catch (IOException e) {
             // Nothing we can do here
+        }
+    }
+
+    /**
+     * Sends a netlink request to set flags for given interface
+     *
+     * @param interfaceName The name of the network interface to query.
+     * @param flags power-of-two integer flags to set or unset. A flag to set should be passed as
+     *        is as a power-of-two value, and a flag to remove should be passed inversed as -1 with
+     *        a single bit down. For example: IFF_UP, ~IFF_BROADCAST...
+     * @return true if the request finished successfully, otherwise false.
+     */
+    public static boolean setInterfaceFlags(@NonNull String interfaceName, int... flags) {
+        final RtNetlinkLinkMessage ntMsg =
+                RtNetlinkLinkMessage.createSetFlagsMessage(interfaceName, /*seqNo*/ 0, flags);
+        if (ntMsg == null) {
+            Log.e(TAG, "Failed to create message to set interface flags for interface "
+                    + interfaceName + ", input flags are: " + Arrays.toString(flags));
+            return false;
+        }
+        final byte[] msg = ntMsg.pack(ByteOrder.nativeOrder());
+        try {
+            NetlinkUtils.sendOneShotKernelMessage(NETLINK_ROUTE, msg);
+            return true;
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to set flags for: " + interfaceName, e);
+            return false;
+        }
+    }
+
+    /**
+     * Sends a netlink request to set MTU for given interface
+     *
+     * @param interfaceName The name of the network interface to query.
+     * @param mtu MTU value to set for the interface.
+     * @return true if the request finished successfully, otherwise false.
+     */
+    public static boolean setInterfaceMtu(@NonNull String interfaceName, int mtu) {
+        if (mtu < 68) {
+            Log.e(TAG, "Invalid mtu: " + mtu + ", mtu should be greater than 68 referring RFC791");
+            return false;
+        }
+        final RtNetlinkLinkMessage ntMsg =
+                RtNetlinkLinkMessage.createSetMtuMessage(interfaceName, /*seqNo*/ 0, mtu);
+        if (ntMsg == null) {
+            Log.e(TAG, "Failed to create message to set MTU to " + mtu
+                    + "for interface " + interfaceName);
+            return false;
+        }
+        final byte[] msg = ntMsg.pack(ByteOrder.nativeOrder());
+        try {
+            NetlinkUtils.sendOneShotKernelMessage(NETLINK_ROUTE, msg);
+            return true;
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to set MTU to " + mtu + " for: " + interfaceName, e);
+            return false;
         }
     }
 }

@@ -17,6 +17,8 @@
 #define LOG_TAG "NetBpfLoad"
 
 #include <arpa/inet.h>
+#include <bpf/btf.h>
+#include <bpf/libbpf.h>
 #include <dirent.h>
 #include <elf.h>
 #include <errno.h>
@@ -50,6 +52,7 @@
 #include <android-base/logging.h>
 #include <android-base/macros.h>
 #include <android-base/properties.h>
+#include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <android-base/unique_fd.h>
@@ -60,7 +63,8 @@
 #include "bpf_map_def.h"
 
 // The following matches bpf_helpers.h, which is only for inclusion in bpf code
-#define BPFLOADER_MAINLINE_VERSION 42u
+#define BPFLOADER_MAINLINE_S_VERSION 42u
+#define BPFLOADER_MAINLINE_25Q2_VERSION 47u
 
 using android::base::EndsWith;
 using android::base::GetIntProperty;
@@ -121,6 +125,7 @@ static constexpr bool specified(domain d) {
 struct Location {
     const char* const dir = "";
     const char* const prefix = "";
+    const bool t_plus = true;
 };
 
 // Returns the build type string (from ro.build.type).
@@ -551,9 +556,9 @@ static int readCodeSections(ifstream& elfFile, vector<codeSection>& cs) {
         vector<string> csSymNames;
         ret = getSectionSymNames(elfFile, oldName, csSymNames, STT_FUNC);
         if (ret || !csSymNames.size()) return ret;
-        for (size_t i = 0; i < progDefNames.size(); ++i) {
-            if (!progDefNames[i].compare(csSymNames[0] + "_def")) {
-                cs_temp.prog_def = pd[i];
+        for (size_t j = 0; j < progDefNames.size(); ++j) {
+            if (!progDefNames[j].compare(csSymNames[0] + "_def")) {
+                cs_temp.prog_def = pd[j];
                 break;
             }
         }
@@ -616,9 +621,6 @@ static bool mapMatchesExpectations(const unique_fd& fd, const string& mapName,
     if (type == BPF_MAP_TYPE_DEVMAP || type == BPF_MAP_TYPE_DEVMAP_HASH)
         desired_map_flags |= BPF_F_RDONLY_PROG;
 
-    if (type == BPF_MAP_TYPE_LPM_TRIE)
-        desired_map_flags |= BPF_F_NO_PREALLOC;
-
     // The .h file enforces that this is a power of two, and page size will
     // also always be a power of two, so this logic is actually enough to
     // force it to be a multiple of the page size, as required by the kernel.
@@ -649,10 +651,185 @@ static bool mapMatchesExpectations(const unique_fd& fd, const string& mapName,
     return false;
 }
 
+static int setBtfDatasecSize(ifstream &elfFile, struct btf *btf,
+                             struct btf_type *bt) {
+    const char *name = btf__name_by_offset(btf, bt->name_off);
+    if (!name) {
+        ALOGE("Couldn't resolve section name, errno: %d", errno);
+        return -errno;
+    }
+
+    vector<char> data;
+    int ret = readSectionByName(name, elfFile, data);
+    if (ret) {
+        ALOGE("Couldn't read section %s, ret: %d", name, ret);
+        return ret;
+    }
+    bt->size = data.size();
+    return 0;
+}
+
+static int getSymOffsetByName(ifstream &elfFile, const char *name, int *off) {
+    vector<Elf64_Sym> symtab;
+    int ret = readSymTab(elfFile, 1 /* sort */, symtab);
+    if (ret) return ret;
+    for (int i = 0; i < (int)symtab.size(); i++) {
+        string s;
+        ret = getSymName(elfFile, symtab[i].st_name, s);
+        if (ret) continue;
+        if (!strcmp(s.c_str(), name)) {
+            *off = symtab[i].st_value;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int setBtfVarOffset(ifstream &elfFile, struct btf *btf,
+                           struct btf_type *datasecBt) {
+    int i, vars = btf_vlen(datasecBt);
+    struct btf_var_secinfo *vsi;
+    const char *datasecName = btf__name_by_offset(btf, datasecBt->name_off);
+    if (!datasecName) {
+        ALOGE("Couldn't resolve section name, errno: %d", errno);
+        return -errno;
+    }
+
+    for (i = 0, vsi = btf_var_secinfos(datasecBt); i < vars; i++, vsi++) {
+        const struct btf_type *varBt = btf__type_by_id(btf, vsi->type);
+        if (!varBt || !btf_is_var(varBt)) {
+            ALOGE("Found non VAR kind btf_type, section: %s id: %d", datasecName,
+                  vsi->type);
+            return -1;
+        }
+
+        const struct btf_var *var = btf_var(varBt);
+        if (var->linkage == BTF_VAR_STATIC) continue;
+
+        const char *varName = btf__name_by_offset(btf, varBt->name_off);
+        if (!varName) {
+            ALOGE("Failed to resolve var name, section: %s", datasecName);
+            return -1;
+        }
+
+        int off;
+        int ret = getSymOffsetByName(elfFile, varName, &off);
+        if (ret) {
+            ALOGE("No offset found in symbol table, section: %s, var: %s, ret: %d",
+                  datasecName, varName, ret);
+            return ret;
+        }
+        vsi->offset = off;
+    }
+    return 0;
+}
+
+static int loadBtf(ifstream &elfFile, struct btf *btf) {
+    int ret;
+    for (unsigned int i = 1; i < btf__type_cnt(btf); ++i) {
+        struct btf_type *bt = (struct btf_type *)btf__type_by_id(btf, i);
+        if (!btf_is_datasec(bt)) continue;
+        ret = setBtfDatasecSize(elfFile, btf, bt);
+        if (ret) return ret;
+        ret = setBtfVarOffset(elfFile, btf, bt);
+        if (ret) return ret;
+    }
+
+    ret = btf__load_into_kernel(btf);
+    if (ret) {
+        if (errno != EINVAL) {
+            ALOGE("btf__load_into_kernel failed, errno: %d", errno);
+            return ret;
+        };
+        // For BTF_KIND_FUNC, newer kernels can read the BTF_INFO_VLEN bits of
+        // struct btf_type to distinguish static vs. global vs. extern
+        // functions, but older kernels enforce that only the BTF_INFO_KIND bits
+        // can be set. Retry with non-BTF_INFO_KIND bits zeroed out to handle
+        // this case.
+        for (unsigned int i = 1; i < btf__type_cnt(btf); ++i) {
+            struct btf_type *bt = (struct btf_type *)btf__type_by_id(btf, i);
+            if (btf_is_func(bt)) {
+                bt->info = (BTF_INFO_KIND(bt->info)) << 24;
+            }
+        }
+        ret = btf__load_into_kernel(btf);
+        if (ret) {
+            ALOGE("btf__load_into_kernel retry failed, errno: %d", errno);
+            return ret;
+        };
+    }
+    return 0;
+}
+
+int getKeyValueTids(const struct btf *btf, const char *mapName,
+                    uint32_t expectedKeySize, uint32_t expectedValueSize,
+                    uint32_t *keyTypeId, uint32_t *valueTypeId) {
+    const struct btf_type *kvBt;
+    const struct btf_member *key, *value;
+    const size_t max_name = 256;
+    char kvTypeName[max_name];
+    int64_t keySize, valueSize;
+    int32_t kvId;
+
+    if (snprintf(kvTypeName, max_name, "____btf_map_%s", mapName) == max_name) {
+        ALOGE("____btf_map_%s is too long", mapName);
+        return -1;
+    }
+
+    kvId = btf__find_by_name(btf, kvTypeName);
+    if (kvId < 0) {
+        ALOGE("section not found, map: %s typeName: %s", mapName, kvTypeName);
+        return -1;
+    }
+
+    kvBt = btf__type_by_id(btf, kvId);
+    if (!kvBt) {
+        ALOGE("Couldn't find BTF type, map: %s id: %u", mapName, kvId);
+        return -1;
+    }
+
+    if (!btf_is_struct(kvBt) || btf_vlen(kvBt) < 2) {
+        ALOGE("Non Struct kind or invalid vlen, map: %s id: %u", mapName, kvId);
+        return -1;
+    }
+
+    key = btf_members(kvBt);
+    value = key + 1;
+
+    keySize = btf__resolve_size(btf, key->type);
+    if (keySize < 0) {
+        ALOGE("Couldn't get key size, map: %s errno: %d", mapName, errno);
+        return -1;
+    }
+
+    valueSize = btf__resolve_size(btf, value->type);
+    if (valueSize < 0) {
+        ALOGE("Couldn't get value size, map: %s errno: %d", mapName, errno);
+        return -1;
+    }
+
+    if (expectedKeySize != keySize || expectedValueSize != valueSize) {
+        ALOGE("Key value size mismatch, map: %s key size: %d expected key size: "
+              "%d value size: %d expected value size: %d",
+              mapName, (uint32_t)keySize, expectedKeySize, (uint32_t)valueSize,
+              expectedValueSize);
+        return -1;
+    }
+
+    *keyTypeId = key->type;
+    *valueTypeId = value->type;
+
+    return 0;
+}
+
+static bool isBtfSupported(enum bpf_map_type type) {
+    return type != BPF_MAP_TYPE_DEVMAP_HASH && type != BPF_MAP_TYPE_RINGBUF;
+}
+
 static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>& mapFds,
                       const char* prefix, const unsigned int bpfloader_ver) {
     int ret;
-    vector<char> mdData;
+    vector<char> mdData, btfData;
     vector<struct bpf_map_def> md;
     vector<string> mapNames;
     string objName = pathToObjName(string(elfPath));
@@ -678,6 +855,27 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
 
     ret = getSectionSymNames(elfFile, "maps", mapNames);
     if (ret) return ret;
+
+    struct btf *btf = NULL;
+    auto scopeGuard = base::make_scope_guard([btf] { if (btf) btf__free(btf); });
+    if (isAtLeastKernelVersion(5, 10, 0)) {
+        // Untested on Linux Kernel 5.4, but likely compatible.
+        // On Linux Kernels older than 4.18 BPF_BTF_LOAD command doesn't exist.
+        // On Linux Kernels older than 5.2 BTF_KIND_VAR and BTF_KIND_DATASEC don't exist.
+        ret = readSectionByName(".BTF", elfFile, btfData);
+        if (ret) {
+            ALOGE("Failed to read .BTF section, ret:%d", ret);
+            return ret;
+        }
+        btf = btf__new(btfData.data(), btfData.size());
+        if (btf == NULL) {
+            ALOGE("btf__new failed, errno: %d", errno);
+            return -errno;
+        }
+
+        ret = loadBtf(elfFile, btf);
+        if (ret) return ret;
+    }
 
     unsigned kvers = kernelVersion();
 
@@ -732,6 +930,12 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
         }
 
         enum bpf_map_type type = md[i].type;
+        if (type == BPF_MAP_TYPE_LPM_TRIE && !isAtLeastKernelVersion(4, 14, 0)) {
+            // On Linux Kernels older than 4.14 this map type doesn't exist - autoskip.
+            ALOGD("skipping LPM_TRIE map %s - requires kver 4.14+", mapNames[i].c_str());
+            mapFds.push_back(unique_fd());
+            continue;
+        }
         if (type == BPF_MAP_TYPE_DEVMAP && !isAtLeastKernelVersion(4, 14, 0)) {
             // On Linux Kernels older than 4.14 this map type doesn't exist, but it can kind
             // of be approximated: ARRAY has the same userspace api, though it is not usable
@@ -794,16 +998,30 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
               .key_size = md[i].key_size,
               .value_size = md[i].value_size,
               .max_entries = max_entries,
-              .map_flags = md[i].map_flags | (type == BPF_MAP_TYPE_LPM_TRIE ? BPF_F_NO_PREALLOC : 0),
+              .map_flags = md[i].map_flags,
             };
             if (isAtLeastKernelVersion(4, 15, 0))
                 strlcpy(req.map_name, mapNames[i].c_str(), sizeof(req.map_name));
+
+            bool haveBtf = btf && isBtfSupported(type);
+            if (haveBtf) {
+                uint32_t kTid, vTid;
+                ret = getKeyValueTids(btf, mapNames[i].c_str(), md[i].key_size,
+                                      md[i].value_size, &kTid, &vTid);
+                if (ret) return ret;
+                req.btf_fd = btf__fd(btf);
+                req.btf_key_type_id = kTid;
+                req.btf_value_type_id = vTid;
+            }
+
             fd.reset(bpf(BPF_MAP_CREATE, req));
             saved_errno = errno;
             if (fd.ok()) {
-              ALOGD("bpf_create_map[%s] -> %d", mapNames[i].c_str(), fd.get());
+                ALOGD("bpf_create_map[%s] btf:%d -> %d",
+                      mapNames[i].c_str(), haveBtf, fd.get());
             } else {
-              ALOGE("bpf_create_map[%s] -> %d errno:%d", mapNames[i].c_str(), fd.get(), saved_errno);
+                ALOGE("bpf_create_map[%s] btf:%d -> %d errno:%d",
+                      mapNames[i].c_str(), haveBtf, fd.get(), saved_errno);
             }
         }
 
@@ -820,14 +1038,14 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
                                    "tmp_map_" + objName + "_" + mapNames[i];
                 ret = bpfFdPin(fd, createLoc.c_str());
                 if (ret) {
-                    int err = errno;
+                    const int err = errno;
                     ALOGE("create %s -> %d [%d:%s]", createLoc.c_str(), ret, err, strerror(err));
                     return -err;
                 }
                 ret = renameat2(AT_FDCWD, createLoc.c_str(),
                                 AT_FDCWD, mapPinLoc.c_str(), RENAME_NOREPLACE);
                 if (ret) {
-                    int err = errno;
+                    const int err = errno;
                     ALOGE("rename %s %s -> %d [%d:%s]", createLoc.c_str(), mapPinLoc.c_str(), ret,
                           err, strerror(err));
                     return -err;
@@ -835,32 +1053,34 @@ static int createMaps(const char* elfPath, ifstream& elfFile, vector<unique_fd>&
             } else {
                 ret = bpfFdPin(fd, mapPinLoc.c_str());
                 if (ret) {
-                    int err = errno;
+                    const int err = errno;
                     ALOGE("pin %s -> %d [%d:%s]", mapPinLoc.c_str(), ret, err, strerror(err));
                     return -err;
                 }
             }
             ret = chmod(mapPinLoc.c_str(), md[i].mode);
             if (ret) {
-                int err = errno;
+                const int err = errno;
                 ALOGE("chmod(%s, 0%o) = %d [%d:%s]", mapPinLoc.c_str(), md[i].mode, ret, err,
                       strerror(err));
                 return -err;
             }
             ret = chown(mapPinLoc.c_str(), (uid_t)md[i].uid, (gid_t)md[i].gid);
             if (ret) {
-                int err = errno;
+                const int err = errno;
                 ALOGE("chown(%s, %u, %u) = %d [%d:%s]", mapPinLoc.c_str(), md[i].uid, md[i].gid,
                       ret, err, strerror(err));
                 return -err;
             }
         }
 
-        int mapId = bpfGetFdMapId(fd);
-        if (mapId == -1) {
-            if (isAtLeastKernelVersion(4, 14, 0))
-                ALOGE("bpfGetFdMapId failed, ret: %d [%d]", mapId, errno);
-        } else {
+        if (isAtLeastKernelVersion(4, 14, 0)) {
+            int mapId = bpfGetFdMapId(fd);
+            if (mapId == -1) {
+                const int err = errno;
+                ALOGE("bpfGetFdMapId failed, errno: %d", err);
+                return -err;
+            }
             ALOGI("map %s id %d", mapPinLoc.c_str(), mapId);
         }
 
@@ -1003,7 +1223,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
         if (access(progPinLoc.c_str(), F_OK) == 0) {
             fd.reset(retrieveProgram(progPinLoc.c_str()));
             ALOGD("New bpf prog load reusing prog %s, ret: %d (%s)", progPinLoc.c_str(), fd.get(),
-                  (!fd.ok() ? std::strerror(errno) : "no error"));
+                  !fd.ok() ? std::strerror(errno) : "ok");
             reuse = true;
         } else {
             static char log_buf[1 << 20];  // 1 MiB logging buffer
@@ -1034,7 +1254,7 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
 
             ALOGD("BPF_PROG_LOAD call for %s (%s) returned '%s' fd: %d (%s)", elfPath,
                   cs[i].name.c_str(), log_oneline ? log_buf : "{multiline}",
-                  fd.get(), (!fd.ok() ? std::strerror(errno) : "ok"));
+                  fd.get(), !fd.ok() ? std::strerror(errno) : "ok");
 
             if (!fd.ok()) {
                 // kernel NULL terminates log_buf, so this checks for non-empty string
@@ -1063,14 +1283,14 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
                                    "tmp_prog_" + objName + '_' + string(name);
                 ret = bpfFdPin(fd, createLoc.c_str());
                 if (ret) {
-                    int err = errno;
+                    const int err = errno;
                     ALOGE("create %s -> %d [%d:%s]", createLoc.c_str(), ret, err, strerror(err));
                     return -err;
                 }
                 ret = renameat2(AT_FDCWD, createLoc.c_str(),
                                 AT_FDCWD, progPinLoc.c_str(), RENAME_NOREPLACE);
                 if (ret) {
-                    int err = errno;
+                    const int err = errno;
                     ALOGE("rename %s %s -> %d [%d:%s]", createLoc.c_str(), progPinLoc.c_str(), ret,
                           err, strerror(err));
                     return -err;
@@ -1078,30 +1298,52 @@ static int loadCodeSections(const char* elfPath, vector<codeSection>& cs, const 
             } else {
                 ret = bpfFdPin(fd, progPinLoc.c_str());
                 if (ret) {
-                    int err = errno;
+                    const int err = errno;
                     ALOGE("create %s -> %d [%d:%s]", progPinLoc.c_str(), ret, err, strerror(err));
                     return -err;
                 }
             }
             if (chmod(progPinLoc.c_str(), 0440)) {
-                int err = errno;
+                const int err = errno;
                 ALOGE("chmod %s 0440 -> [%d:%s]", progPinLoc.c_str(), err, strerror(err));
                 return -err;
             }
             if (chown(progPinLoc.c_str(), (uid_t)cs[i].prog_def->uid,
                       (gid_t)cs[i].prog_def->gid)) {
-                int err = errno;
+                const int err = errno;
                 ALOGE("chown %s %d %d -> [%d:%s]", progPinLoc.c_str(), cs[i].prog_def->uid,
                       cs[i].prog_def->gid, err, strerror(err));
                 return -err;
             }
         }
 
-        int progId = bpfGetFdProgId(fd);
-        if (progId == -1) {
-            ALOGE("bpfGetFdProgId failed, ret: %d [%d]", progId, errno);
-        } else {
-            ALOGI("prog %s id %d", progPinLoc.c_str(), progId);
+        if (isAtLeastKernelVersion(4, 14, 0)) {
+            int progId = bpfGetFdProgId(fd);
+            if (progId == -1) {
+                const int err = errno;
+                ALOGE("bpfGetFdProgId failed, errno: %d", err);
+                return -err;
+            }
+
+            int jitLen = bpfGetFdJitProgLen(fd);
+            if (jitLen == -1) {
+                const int err = errno;
+                ALOGE("bpfGetFdJitProgLen failed, ret: %d", err);
+                return -err;
+            }
+
+            int xlatLen = bpfGetFdXlatProgLen(fd);
+            if (xlatLen == -1) {
+                const int err = errno;
+                ALOGE("bpfGetFdXlatProgLen failed, ret: %d", err);
+                return -err;
+            }
+            ALOGI("prog %s id %d len jit:%d xlat:%d", progPinLoc.c_str(), progId, jitLen, xlatLen);
+
+            if (!jitLen && bpfloader_ver >= BPFLOADER_MAINLINE_25Q2_VERSION) {
+                ALOGE("Kernel eBPF JIT failure for %s", progPinLoc.c_str());
+                return -ENOTSUP;
+            }
         }
     }
 
@@ -1159,7 +1401,7 @@ int loadProg(const char* const elfPath, const unsigned int bpfloader_ver,
     ret = readCodeSections(elfFile, cs);
     // BPF .o's with no programs are only supported by mainline netbpfload,
     // make sure .o's targeting non-mainline (ie. S) bpfloader don't show up.
-    if (ret == -ENOENT && bpfLoaderMinVer >= BPFLOADER_MAINLINE_VERSION)
+    if (ret == -ENOENT && bpfLoaderMinVer >= BPFLOADER_MAINLINE_S_VERSION)
         return 0;
     if (ret) {
         ALOGE("Couldn't read all code sections in %s", elfPath);
@@ -1188,8 +1430,9 @@ static bool exists(const char* const path) {
 const Location locations[] = {
         // S+ Tethering mainline module (network_stack): tether offload
         {
-                .dir = BPFROOT "/",
+                .dir = BPFROOT "/tethering/",
                 .prefix = "tethering/",
+                .t_plus = false,
         },
         // T+ Tethering mainline module (shared with netd & system server)
         // netutils_wrapper (for iptables xt_bpf) has access to programs
@@ -1383,43 +1626,41 @@ static bool isWear() {
     return wear;
 }
 
+static int libbpfPrint(enum libbpf_print_level lvl, const char *const formatStr,
+                       va_list argList) {
+    int32_t prio;
+    switch (lvl) {
+      case LIBBPF_WARN:
+        prio = ANDROID_LOG_WARN;
+        break;
+      case LIBBPF_INFO:
+        prio = ANDROID_LOG_INFO;
+        break;
+      case LIBBPF_DEBUG:
+        prio = ANDROID_LOG_DEBUG;
+        break;
+    }
+    char *s = strdup(formatStr ?: "(no format string)");
+    int len = strlen(s);
+    if (len && s[len - 1] == '\n')
+        s[len - 1] = 0;
+    LOG_PRI_VA(prio, LOG_TAG, s, argList);
+    free(s);
+    return 0;
+}
+
 static int doLoad(char** argv, char * const envp[]) {
+    if (!isAtLeastS) {
+        ALOGE("Impossible - not reachable on Android <S.");
+        // for safety, we don't fail, this is a just-in-case workaround
+        // for any possible busted 'optimized' start everything vendor init hacks on R
+        return 0;
+    }
+    libbpf_set_print(libbpfPrint);
+
     const bool runningAsRoot = !getuid();  // true iff U QPR3 or V+
 
-    // Any released device will have codename REL instead of a 'real' codename.
-    // For safety: default to 'REL' so we default to unreleased=false on failure.
-    const bool unreleased = (GetProperty("ro.build.version.codename", "REL") != "REL");
-
-    // goog/main device_api_level is bumped *way* before aosp/main api level
-    // (the latter only gets bumped during the push of goog/main to aosp/main)
-    //
-    // Since we develop in AOSP, we want it to behave as if it was bumped too.
-    //
-    // Note that AOSP doesn't really have a good api level (for example during
-    // early V dev cycle, it would have *all* of T, some but not all of U, and some V).
-    // One could argue that for our purposes AOSP api level should be infinite or 10000.
-    //
-    // This could also cause api to be increased in goog/main or other branches,
-    // but I can't imagine a case where this would be a problem: the problem
-    // is rather a too low api level, rather than some ill defined high value.
-    // For example as I write this aosp is 34/U, and goog is 35/V,
-    // we want to treat both goog & aosp as 35/V, but it's harmless if we
-    // treat goog as 36 because that value isn't yet defined to mean anything,
-    // and we thus never compare against it.
-    //
-    // Also note that 'android_get_device_api_level()' is what the
-    //   //system/core/init/apex_init_util.cpp
-    // apex init .XXrc parsing code uses for XX filtering.
-    //
-    // That code has a hack to bump <35 to 35 (to force aosp/main to parse .35rc),
-    // but could (should?) perhaps be adjusted to match this.
-    const int effective_api_level = android_get_device_api_level() + (int)unreleased;
-    const bool isAtLeastT = (effective_api_level >= __ANDROID_API_T__);
-    const bool isAtLeastU = (effective_api_level >= __ANDROID_API_U__);
-    const bool isAtLeastV = (effective_api_level >= __ANDROID_API_V__);
-    const bool isAtLeastW = (effective_api_level >  __ANDROID_API_V__);  // TODO: switch to W
-
-    const int first_api_level = GetIntProperty("ro.board.first_api_level", effective_api_level);
+    const int first_api_level = GetIntProperty("ro.board.first_api_level", api_level);
 
     // last in U QPR2 beta1
     const bool has_platform_bpfloader_rc = exists("/system/etc/init/bpfloader.rc");
@@ -1427,17 +1668,19 @@ static int doLoad(char** argv, char * const envp[]) {
     const bool has_platform_netbpfload_rc = exists("/system/etc/init/netbpfload.rc");
 
     // Version of Network BpfLoader depends on the Android OS version
-    unsigned int bpfloader_ver = BPFLOADER_MAINLINE_VERSION;  // [42u]
+    unsigned int bpfloader_ver = BPFLOADER_MAINLINE_S_VERSION;  // [42u]
     if (isAtLeastT) ++bpfloader_ver;     // [43] BPFLOADER_MAINLINE_T_VERSION
     if (isAtLeastU) ++bpfloader_ver;     // [44] BPFLOADER_MAINLINE_U_VERSION
     if (runningAsRoot) ++bpfloader_ver;  // [45] BPFLOADER_MAINLINE_U_QPR3_VERSION
     if (isAtLeastV) ++bpfloader_ver;     // [46] BPFLOADER_MAINLINE_V_VERSION
-    if (isAtLeastW) ++bpfloader_ver;     // [47] BPFLOADER_MAINLINE_W_VERSION
+    if (isAtLeast25Q2) ++bpfloader_ver;  // [47] BPFLOADER_MAINLINE_25Q2_VERSION
 
-    ALOGI("NetBpfLoad v0.%u (%s) api:%d/%d kver:%07x (%s) uid:%d rc:%d%d",
-          bpfloader_ver, argv[0], android_get_device_api_level(), effective_api_level,
-          kernelVersion(), describeArch(), getuid(),
-          has_platform_bpfloader_rc, has_platform_netbpfload_rc);
+    ALOGI("NetBpfLoad v0.%u (%s) api:%d/%d kver:%07x (%s) libbpf: v%u.%u "
+          "uid:%d rc:%d%d",
+          bpfloader_ver, argv[0], android_get_device_api_level(), api_level,
+          kernelVersion(), describeArch(), libbpf_major_version(),
+          libbpf_minor_version(), getuid(), has_platform_bpfloader_rc,
+          has_platform_netbpfload_rc);
 
     if (!has_platform_bpfloader_rc && !has_platform_netbpfload_rc) {
         ALOGE("Unable to find platform's bpfloader & netbpfload init scripts.");
@@ -1451,14 +1694,9 @@ static int doLoad(char** argv, char * const envp[]) {
 
     logTetheringApexVersion();
 
-    if (!isAtLeastT) {
-        ALOGE("Impossible - not reachable on Android <T.");
-        return 1;
-    }
-
     // both S and T require kernel 4.9 (and eBpf support)
-    if (isAtLeastT && !isAtLeastKernelVersion(4, 9, 0)) {
-        ALOGW("Android T requires kernel 4.9.");
+    if (!isAtLeastKernelVersion(4, 9, 0)) {
+        ALOGW("Android S & T require kernel 4.9.");
     }
 
     // U bumps the kernel requirement up to 4.14
@@ -1472,11 +1710,23 @@ static int doLoad(char** argv, char * const envp[]) {
         ALOGW("Android V requires kernel 4.19.");
     }
 
+    // 25Q2 bumps the kernel requirement up to 5.4
+    // see also: //system/netd/tests/kernel_test.cpp TestKernel54
+    if (isAtLeast25Q2 && !isAtLeastKernelVersion(5, 4, 0)) {
+        ALOGE("Android 25Q2 requires kernel 5.4.");
+        return 1;
+    }
+
     // Technically already required by U, but only enforce on V+
     // see also: //system/netd/tests/kernel_test.cpp TestKernel64Bit
     if (isAtLeastV && isKernel32Bit() && isAtLeastKernelVersion(5, 16, 0)) {
         ALOGE("Android V+ platform with 32 bit kernel version >= 5.16.0 is unsupported");
         if (!isTV()) return 1;
+    }
+
+    if (isKernel32Bit() && isAtLeast25Q2) {
+        ALOGE("Android 25Q2 requires 64 bit kernel.");
+        return 1;
     }
 
     // 6.6 is highest version supported by Android V, so this is effectively W+ (sdk=36+)
@@ -1495,13 +1745,13 @@ static int doLoad(char** argv, char * const envp[]) {
         bool bad = false;
 
         if (!isLtsKernel()) {
-            ALOGW("Android V only supports LTS kernels.");
+            ALOGW("Android V+ only supports LTS kernels.");
             bad = true;
         }
 
 #define REQUIRE(maj, min, sub) \
         if (isKernelVersion(maj, min) && !isAtLeastKernelVersion(maj, min, sub)) { \
-            ALOGW("Android V requires %d.%d kernel to be %d.%d.%d+.", maj, min, maj, min, sub); \
+            ALOGW("Android V+ requires %d.%d kernel to be %d.%d.%d+.", maj, min, maj, min, sub); \
             bad = true; \
         }
 
@@ -1511,6 +1761,7 @@ static int doLoad(char** argv, char * const envp[]) {
         REQUIRE(5, 15, 136)
         REQUIRE(6, 1, 57)
         REQUIRE(6, 6, 0)
+        REQUIRE(6, 12, 0)
 
 #undef REQUIRE
 
@@ -1549,7 +1800,7 @@ static int doLoad(char** argv, char * const envp[]) {
         if (isArm() && (isTV() || isWear())) {
             // exempt Arm TV or Wear devices (arm32 ABI is far less problematic than x86-32)
             ALOGW("[Arm TV/Wear] 32-bit userspace unsupported on 6.2+ kernels.");
-        } else if (first_api_level <= __ANDROID_API_T__ && isArm()) {
+        } else if (first_api_level <= 33 /*T*/ && isArm()) {
             // also exempt Arm devices upgrading with major kernel rev from T-
             // might possibly be better for them to run with a newer kernel...
             ALOGW("[Arm KernelUpRev] 32-bit userspace unsupported on 6.2+ kernels.");
@@ -1566,6 +1817,19 @@ static int doLoad(char** argv, char * const envp[]) {
     if (!isArm() && isUserspace32bit() && isAtLeastKernelVersion(6, 7, 0)) {
         ALOGE("64-bit userspace required on 6.7+ kernels.");
         return 1;
+    }
+
+    if (isAtLeast25Q2) {
+        FILE * f = fopen("/system/etc/init/netbpfload.rc", "re");
+        if (!f) {
+            ALOGE("failure opening /system/etc/init/netbpfload.rc");
+            return 1;
+        }
+        int y = -1, q = -1, a = -1, b = -1, c = -1;
+        int v = fscanf(f, "# %d %d %d %d %d #", &y, &q, &a, &b, &c);
+        ALOGI("detected %d of 5: %dQ%d api:%d.%d.%d", v, y, q, a, b, c);
+        fclose(f);
+        if (v != 5 || y != 2025 || q != 2 || a != 36 || b || c) return 1;
     }
 
     // Ensure we can determine the Android build type.
@@ -1613,18 +1877,22 @@ static int doLoad(char** argv, char * const envp[]) {
     //  which could otherwise fail with ENOENT during object pinning or renaming,
     //  due to ordering issues)
     for (const auto& location : locations) {
+        if (location.t_plus && !isAtLeastT) continue;
         if (createSysFsBpfSubDir(location.prefix)) return 1;
     }
 
-    // Note: there's no actual src dir for fs_bpf_loader .o's,
-    // so it is not listed in 'locations[].prefix'.
-    // This is because this is primarily meant for triggering genfscon rules,
-    // and as such this will likely always be the case.
-    // Thus we need to manually create the /sys/fs/bpf/loader subdirectory.
-    if (createSysFsBpfSubDir("loader")) return 1;
+    if (isAtLeastT) {
+        // Note: there's no actual src dir for fs_bpf_loader .o's,
+        // so it is not listed in 'locations[].prefix'.
+        // This is because this is primarily meant for triggering genfscon rules,
+        // and as such this will likely always be the case.
+        // Thus we need to manually create the /sys/fs/bpf/loader subdirectory.
+        if (createSysFsBpfSubDir("loader")) return 1;
+    }
 
     // Load all ELF objects, create programs and maps, and pin them
     for (const auto& location : locations) {
+        if (location.t_plus && !isAtLeastT) continue;
         if (loadAllElfObjects(bpfloader_ver, location) != 0) {
             ALOGE("=== CRITICAL FAILURE LOADING BPF PROGRAMS FROM %s ===", location.dir);
             ALOGE("If this triggers reliably, you're probably missing kernel options or patches.");
@@ -1645,6 +1913,9 @@ static int doLoad(char** argv, char * const envp[]) {
         return 1;
     }
 
+    // on S we haven't created this subdir yet, but we need it for 'mainline_done' flag below
+    if (!isAtLeastT && createSysFsBpfSubDir("netd_shared")) return 1;
+
     // leave a flag that we're done
     if (createSysFsBpfSubDir("netd_shared/mainline_done")) return 1;
 
@@ -1657,17 +1928,17 @@ static int doLoad(char** argv, char * const envp[]) {
     }
 
     // unreachable before U QPR3
-    {
+    if (exists(uprobestatsBpfLoader)) {
       ALOGI("done, transferring control to uprobestatsbpfload.");
       const char *args[] = {
           uprobestatsBpfLoader,
           NULL,
       };
       execve(args[0], (char **)args, envp);
+      ALOGI("unable to execute uprobestatsbpfload, transferring control to "
+            "platform bpfloader.");
     }
 
-    ALOGI("unable to execute uprobestatsbpfload, transferring control to "
-          "platform bpfloader.");
     // platform BpfLoader *needs* to run as root
     const char * args[] = { platformBpfLoader, NULL, };
     execve(args[0], (char**)args, envp);
@@ -1679,7 +1950,12 @@ static int doLoad(char** argv, char * const envp[]) {
 }  // namespace android
 
 int main(int argc, char** argv, char * const envp[]) {
-    InitLogging(argv, &KernelLogger);
+    if (android::bpf::isAtLeastT) {
+        InitLogging(argv, &KernelLogger);
+    } else {
+        // S lacks the sepolicy to make non-root uid KernelLogger viable
+        InitLogging(argv);
+    }
 
     if (argc == 2 && !strcmp(argv[1], "done")) {
         // we're being re-exec'ed from platform bpfloader to 'finalize' things

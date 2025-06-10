@@ -27,14 +27,14 @@ import android.net.NetworkCapabilities.TRANSPORT_WIFI
 import android.net.NetworkRequest
 import android.net.cts.util.CtsNetUtils
 import android.net.cts.util.CtsTetheringUtils
-import android.net.wifi.ScanResult
 import android.net.wifi.SoftApConfiguration
 import android.net.wifi.SoftApConfiguration.SECURITY_TYPE_WPA2_PSK
 import android.net.wifi.WifiConfiguration
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
-import android.net.wifi.WifiNetworkSpecifier
 import android.net.wifi.WifiSsid
+import android.os.Build.VERSION.CODENAME
+import android.os.Build.VERSION.SDK_INT
 import androidx.test.platform.app.InstrumentationRegistry
 import com.android.compatibility.common.util.PropertyUtil
 import com.android.modules.utils.build.SdkLevel
@@ -64,6 +64,17 @@ class ConnectivityMultiDevicesSnippet : Snippet {
         cbHelper.unregisterAll()
     }
 
+    private fun isAtLeastPreReleaseCodename(codeName: String): Boolean {
+        // Special case "REL", which means the build is not a pre-release build.
+        if ("REL".equals(CODENAME)) {
+            return false
+        }
+
+        // Otherwise lexically compare them. Return true if the build codename is equal to or
+        // greater than the requested codename.
+        return CODENAME.compareTo(codeName) >= 0
+    }
+
     @Rpc(description = "Check whether the device has wifi feature.")
     fun hasWifiFeature() = pm.hasSystemFeature(FEATURE_WIFI)
 
@@ -78,6 +89,11 @@ class ConnectivityMultiDevicesSnippet : Snippet {
 
     @Rpc(description = "Return whether the Sdk level is at least V.")
     fun isAtLeastV() = SdkLevel.isAtLeastV()
+
+    @Rpc(description = "Check whether the device is at least B.")
+    fun isAtLeastB(): Boolean {
+        return SDK_INT >= 36 || (SDK_INT == 35 && isAtLeastPreReleaseCodename("Baklava"))
+    }
 
     @Rpc(description = "Return the API level that the VSR requirement must be fulfilled.")
     fun getVsrApiLevel() = PropertyUtil.getVsrApiLevel()
@@ -109,10 +125,7 @@ class ConnectivityMultiDevicesSnippet : Snippet {
     // Suppress warning because WifiManager methods to connect to a config are
     // documented not to be deprecated for privileged users.
     @Suppress("DEPRECATION")
-    fun connectToWifi(ssid: String, passphrase: String): Long {
-        val specifier = WifiNetworkSpecifier.Builder()
-            .setBand(ScanResult.WIFI_BAND_24_GHZ)
-            .build()
+    fun connectToWifi(ssid: String, passphrase: String, requireValidation: Boolean): Long {
         val wifiConfig = WifiConfiguration()
         wifiConfig.SSID = "\"" + ssid + "\""
         wifiConfig.preSharedKey = "\"" + passphrase + "\""
@@ -141,7 +154,8 @@ class ConnectivityMultiDevicesSnippet : Snippet {
             return@runAsShell networkCallback.eventuallyExpect<CapabilitiesChanged> {
                 // Remove double quotes.
                 val ssidFromCaps = (WifiInfo::sanitizeSsid)(it.caps.ssid)
-                ssidFromCaps == ssid && it.caps.hasCapability(NET_CAPABILITY_VALIDATED)
+                ssidFromCaps == ssid && (!requireValidation ||
+                        it.caps.hasCapability(NET_CAPABILITY_VALIDATED))
             }.network.networkHandle
         }
     }

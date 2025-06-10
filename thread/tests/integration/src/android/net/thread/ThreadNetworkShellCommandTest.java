@@ -28,11 +28,13 @@ import static com.google.common.truth.Truth.assertThat;
 
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assume.assumeTrue;
 
 import android.content.Context;
 import android.net.thread.utils.FullThreadDevice;
 import android.net.thread.utils.OtDaemonController;
 import android.net.thread.utils.ThreadFeatureCheckerRule;
+import android.net.thread.utils.ThreadFeatureCheckerRule.RequiresSimulationThreadDevice;
 import android.net.thread.utils.ThreadFeatureCheckerRule.RequiresThreadFeature;
 import android.net.thread.utils.ThreadNetworkControllerWrapper;
 
@@ -66,11 +68,7 @@ public class ThreadNetworkShellCommandTest {
 
     @Before
     public void setUp() throws Exception {
-        // TODO(b/366141754): The current implementation of "thread_network ot-ctl factoryreset"
-        // results in timeout error.
-        // A future fix will provide proper support for factoryreset, allowing us to replace the
-        // legacy "ot-ctl".
-        mOtCtl.factoryReset();
+        mController.leaveAndWait();
 
         mFtd = new FullThreadDevice(10 /* nodeId */);
         ensureThreadEnabled();
@@ -143,6 +141,8 @@ public class ThreadNetworkShellCommandTest {
 
     @Test
     public void forceCountryCode_setCN_getCountryCodeReturnsCN() {
+        assumeTrue(mOtCtl.isCountryCodeSupported());
+
         runThreadCommand("force-country-code enabled CN");
 
         final String result = runThreadCommand("get-country-code");
@@ -168,6 +168,7 @@ public class ThreadNetworkShellCommandTest {
     }
 
     @Test
+    @RequiresSimulationThreadDevice
     public void handleOtCtlCommand_pingFtd_getValidResponse() throws Exception {
         mController.joinAndWait(DEFAULT_DATASET);
         startFtdChild(mFtd, DEFAULT_DATASET);

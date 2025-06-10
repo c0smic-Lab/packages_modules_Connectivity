@@ -35,6 +35,7 @@ import android.os.Build;
 import android.os.Looper;
 import android.text.TextUtils;
 import android.util.ArrayMap;
+import android.util.ArraySet;
 import android.util.Log;
 import android.util.SparseArray;
 
@@ -46,6 +47,7 @@ import com.android.net.module.util.SharedLog;
 import com.android.server.connectivity.ConnectivityResources;
 import com.android.server.connectivity.mdns.util.MdnsUtils;
 
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -92,6 +94,7 @@ public class MdnsAdvertiser {
             new ArrayMap<>();
     private final MdnsFeatureFlags mMdnsFeatureFlags;
     private final Map<String, Integer> mServiceTypeToOffloadPriority;
+    private final ArraySet<String> mOffloadServiceTypeDenyList;
 
     /**
      * Dependencies for {@link MdnsAdvertiser}, useful for testing.
@@ -117,7 +120,7 @@ public class MdnsAdvertiser {
          * Generates a unique hostname to be used by the device.
          */
         @NonNull
-        public String[] generateHostname() {
+        public String[] generateHostname(boolean useShortFormat) {
             // Generate a very-probably-unique hostname. This allows minimizing possible conflicts
             // to the point that probing for it is no longer necessary (as per RFC6762 8.1 last
             // paragraph), and does not leak more information than what could already be obtained by
@@ -127,10 +130,24 @@ public class MdnsAdvertiser {
             // Having a different hostname per interface is an acceptable option as per RFC6762 14.
             // This hostname will change every time the interface is reconnected, so this does not
             // allow tracking the device.
-            // TODO: consider deriving a hostname from other sources, such as the IPv6 addresses
-            // (reusing the same privacy-protecting mechanics).
-            return new String[] {
-                    "Android_" + UUID.randomUUID().toString().replace("-", ""), LOCAL_TLD };
+            if (useShortFormat) {
+                // A short hostname helps reduce the size of APF mDNS filtering programs, and
+                // is necessary for compatibility with some Matter 1.0 devices which assumed
+                // 16 characters is the maximum length.
+                // Generate a hostname matching Android_[0-9A-Z]{8}, which has 36^8 possibilities.
+                // Even with 100 devices advertising the probability of collision is around 2E-9,
+                // which is negligible.
+                final SecureRandom sr = new SecureRandom();
+                final String allowedChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+                final StringBuilder sb = new StringBuilder(8);
+                for (int i = 0; i < 8; i++) {
+                    sb.append(allowedChars.charAt(sr.nextInt(allowedChars.length())));
+                }
+                return new String[]{ "Android_" + sb.toString(), LOCAL_TLD };
+            } else {
+                return new String[]{
+                        "Android_" + UUID.randomUUID().toString().replace("-", ""), LOCAL_TLD};
+            }
         }
     }
 
@@ -143,6 +160,16 @@ public class MdnsAdvertiser {
     public List<OffloadServiceInfoWrapper> getAllInterfaceOffloadServiceInfos(
             @NonNull String interfaceName) {
         return mInterfaceOffloadServices.getOrDefault(interfaceName, Collections.emptyList());
+    }
+
+    private boolean isInOffloadDenyList(@NonNull String serviceType) {
+        for (int i = 0; i < mOffloadServiceTypeDenyList.size(); ++i) {
+            final String denyListServiceType = mOffloadServiceTypeDenyList.valueAt(i);
+            if (DnsUtils.equalsIgnoreDnsCase(serviceType, denyListServiceType)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private final MdnsInterfaceAdvertiser.Callback mInterfaceAdvertiserCb =
@@ -158,19 +185,25 @@ public class MdnsAdvertiser {
             if (mMdnsFeatureFlags.mIsMdnsOffloadFeatureEnabled
                     // TODO: Enable offload when the serviceInfo contains a custom host.
                     && TextUtils.isEmpty(registration.getServiceInfo().getHostname())) {
-                final String interfaceName = advertiser.getSocketInterfaceName();
-                final List<OffloadServiceInfoWrapper> existingOffloadServiceInfoWrappers =
-                        mInterfaceOffloadServices.computeIfAbsent(interfaceName,
-                                k -> new ArrayList<>());
-                // Remove existing offload services from cache for update.
-                existingOffloadServiceInfoWrappers.removeIf(item -> item.mServiceId == serviceId);
+                final String serviceType = registration.getServiceInfo().getServiceType();
+                if (isInOffloadDenyList(serviceType)) {
+                    mSharedLog.i("Offload denied for service type: " + serviceType);
+                } else {
+                    final String interfaceName = advertiser.getSocketInterfaceName();
+                    final List<OffloadServiceInfoWrapper> existingOffloadServiceInfoWrappers =
+                            mInterfaceOffloadServices.computeIfAbsent(interfaceName,
+                                    k -> new ArrayList<>());
+                    // Remove existing offload services from cache for update.
+                    existingOffloadServiceInfoWrappers.removeIf(
+                            item -> item.mServiceId == serviceId);
 
-                byte[] rawOffloadPacket = advertiser.getRawOffloadPayload(serviceId);
-                final OffloadServiceInfoWrapper newOffloadServiceInfoWrapper = createOffloadService(
-                        serviceId, registration, rawOffloadPacket);
-                existingOffloadServiceInfoWrappers.add(newOffloadServiceInfoWrapper);
-                mCb.onOffloadStartOrUpdate(interfaceName,
-                        newOffloadServiceInfoWrapper.mOffloadServiceInfo);
+                    byte[] rawOffloadPacket = advertiser.getRawOffloadPayload(serviceId);
+                    final OffloadServiceInfoWrapper newOffloadServiceInfoWrapper =
+                            createOffloadService(serviceId, registration, rawOffloadPacket);
+                    existingOffloadServiceInfoWrappers.add(newOffloadServiceInfoWrapper);
+                    mCb.onOffloadStartOrUpdate(interfaceName,
+                            newOffloadServiceInfoWrapper.mOffloadServiceInfo);
+                }
             }
 
             // Wait for all current interfaces to be done probing before notifying of success.
@@ -825,12 +858,14 @@ public class MdnsAdvertiser {
         mCb = cb;
         mSocketProvider = socketProvider;
         mDeps = deps;
-        mDeviceHostName = deps.generateHostname();
+        mDeviceHostName = deps.generateHostname(mDnsFeatureFlags.isShortHostnamesEnabled());
         mSharedLog = sharedLog;
         mMdnsFeatureFlags = mDnsFeatureFlags;
         final ConnectivityResources res = new ConnectivityResources(context);
         mServiceTypeToOffloadPriority = parseOffloadPriorityList(
                 res.get().getStringArray(R.array.config_nsdOffloadServicesPriority), sharedLog);
+        mOffloadServiceTypeDenyList = new ArraySet<>(
+                res.get().getStringArray(R.array.config_nsdOffloadServicesDenyList));
     }
 
     private static Map<String, Integer> parseOffloadPriorityList(
@@ -943,7 +978,7 @@ public class MdnsAdvertiser {
         mRegistrations.remove(id);
         // Regenerates host name when registrations removed.
         if (mRegistrations.size() == 0) {
-            mDeviceHostName = mDeps.generateHostname();
+            mDeviceHostName = mDeps.generateHostname(mMdnsFeatureFlags.isShortHostnamesEnabled());
         }
     }
 
@@ -992,6 +1027,19 @@ public class MdnsAdvertiser {
         });
     }
 
+    private List<String> getOffloadSubtype(@NonNull NsdServiceInfo nsdServiceInfo) {
+        // Workaround: Google Cast doesn't announce subtypes per DNS-SD/mDNS spec.
+        // Thus, subtypes aren't offloaded; only "_googlecast._tcp" is.
+        // Subtype responses occur when hardware offload is off.
+        // This solution works because Google Cast doesn't follow the intended usage of subtypes in
+        // the spec, as it always discovers for both the subtype+base type, and only uses the mDNS
+        // subtype as an optimization.
+        if (nsdServiceInfo.getServiceType().equals("_googlecast._tcp")) {
+            return new ArrayList<>();
+        }
+        return new ArrayList<>(nsdServiceInfo.getSubtypes());
+    }
+
     private OffloadServiceInfoWrapper createOffloadService(int serviceId,
             @NonNull Registration registration, byte[] rawOffloadPacket) {
         final NsdServiceInfo nsdServiceInfo = registration.getServiceInfo();
@@ -1002,7 +1050,7 @@ public class MdnsAdvertiser {
         final OffloadServiceInfo offloadServiceInfo = new OffloadServiceInfo(
                 new OffloadServiceInfo.Key(nsdServiceInfo.getServiceName(),
                         nsdServiceInfo.getServiceType()),
-                new ArrayList<>(nsdServiceInfo.getSubtypes()),
+                getOffloadSubtype(nsdServiceInfo),
                 String.join(".", mDeviceHostName),
                 rawOffloadPacket,
                 priority,

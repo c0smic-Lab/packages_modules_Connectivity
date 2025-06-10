@@ -19,12 +19,10 @@ package android.net.thread.cts;
 import static com.google.common.truth.Truth.assertThat;
 
 import static org.junit.Assume.assumeFalse;
-import static org.junit.Assume.assumeNotNull;
 import static org.junit.Assume.assumeTrue;
 
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.net.thread.ThreadNetworkController;
 import android.net.thread.ThreadNetworkManager;
 import android.os.Build;
 
@@ -41,12 +39,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
-import java.util.List;
-
 /** Tests for {@link ThreadNetworkManager}. */
 @SmallTest
 @RunWith(AndroidJUnit4.class)
 public class ThreadNetworkManagerTest {
+    private static final String THREAD_NETWORK_FEATURE = "android.hardware.thread_network";
+
     @Rule public DevSdkIgnoreRule mIgnoreRule = new DevSdkIgnoreRule();
 
     private final Context mContext = ApplicationProvider.getApplicationContext();
@@ -68,7 +66,7 @@ public class ThreadNetworkManagerTest {
     @Test
     @IgnoreUpTo(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void getManager_hasThreadFeatureOnVOrHigher_returnsNonNull() {
-        assumeTrue(mPackageManager.hasSystemFeature("android.hardware.thread_network"));
+        assumeTrue(mPackageManager.hasSystemFeature(THREAD_NETWORK_FEATURE));
 
         assertThat(mManager).isNotNull();
     }
@@ -85,26 +83,10 @@ public class ThreadNetworkManagerTest {
     @Test
     @IgnoreUpTo(Build.VERSION_CODES.TIRAMISU)
     @IgnoreAfter(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    public void getManager_onUAndTv_returnsNonNull() {
+    public void getManager_onUAndTvWithThreadFeature_returnsNonNull() {
         assumeTrue(mPackageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK));
+        assumeTrue(mPackageManager.hasSystemFeature(THREAD_NETWORK_FEATURE));
 
         assertThat(mManager).isNotNull();
-    }
-
-    @Test
-    public void getManager_noThreadFeature_returnsNull() {
-        assumeFalse(mPackageManager.hasSystemFeature("android.hardware.thread_network"));
-
-        assertThat(mManager).isNull();
-    }
-
-    @Test
-    @IgnoreUpTo(Build.VERSION_CODES.TIRAMISU)
-    public void getAllThreadNetworkControllers_managerIsNotNull_returnsNotEmptyList() {
-        assumeNotNull(mManager);
-
-        List<ThreadNetworkController> controllers = mManager.getAllThreadNetworkControllers();
-
-        assertThat(controllers).isNotEmpty();
     }
 }

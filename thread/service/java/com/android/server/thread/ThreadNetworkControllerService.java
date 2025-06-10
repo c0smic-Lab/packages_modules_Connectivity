@@ -128,6 +128,7 @@ import com.android.net.module.util.RoutingCoordinatorManager;
 import com.android.net.module.util.SharedLog;
 import com.android.server.ServiceManagerWrapper;
 import com.android.server.connectivity.ConnectivityResources;
+import com.android.server.connectivity.MockableSystemProperties;
 import com.android.server.thread.openthread.BackboneRouterState;
 import com.android.server.thread.openthread.DnsTxtAttribute;
 import com.android.server.thread.openthread.IChannelMasksReceiver;
@@ -191,6 +192,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
 
     private final Context mContext;
     private final Handler mHandler;
+    private final MockableSystemProperties mSystemProperties;
 
     // Below member fields can only be accessed from the handler thread (`mHandler`). In
     // particular, the constructor does not run on the handler thread, so it must not touch any of
@@ -235,6 +237,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
     ThreadNetworkControllerService(
             Context context,
             Handler handler,
+            MockableSystemProperties systemProperties,
             NetworkProvider networkProvider,
             Supplier<IOtDaemon> otDaemonSupplier,
             ConnectivityManager connectivityManager,
@@ -249,6 +252,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
             Map<Network, LinkProperties> networkToLinkProperties) {
         mContext = context;
         mHandler = handler;
+        mSystemProperties = systemProperties;
         mNetworkProvider = networkProvider;
         mOtDaemonSupplier = otDaemonSupplier;
         mConnectivityManager = connectivityManager;
@@ -286,6 +290,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
         return new ThreadNetworkControllerService(
                 context,
                 handler,
+                new MockableSystemProperties(),
                 networkProvider,
                 () -> IOtDaemon.Stub.asInterface(ServiceManagerWrapper.waitForService("ot_daemon")),
                 connectivityManager,
@@ -355,7 +360,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
                 newOtDaemonConfig(mPersistentSettings.getConfiguration()),
                 mTunIfController.getTunFd(),
                 mNsdPublisher,
-                getMeshcopTxtAttributes(mResources.get()),
+                getMeshcopTxtAttributes(mResources.get(), mSystemProperties),
                 mCountryCodeSupplier.get(),
                 FeatureFlags.isTrelEnabled(),
                 mOtDaemonCallbackProxy);
@@ -365,10 +370,37 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
         return mOtDaemon;
     }
 
+    static String getVendorName(Resources resources, MockableSystemProperties systemProperties) {
+        final String PROP_MANUFACTURER = "ro.product.manufacturer";
+        String vendorName = resources.getString(R.string.config_thread_vendor_name);
+        if (vendorName.equalsIgnoreCase(PROP_MANUFACTURER)) {
+            vendorName = systemProperties.get(PROP_MANUFACTURER);
+            // Assume it's always ASCII chars in ro.product.manufacturer
+            if (vendorName.length() > MAX_VENDOR_NAME_UTF8_BYTES) {
+                vendorName = vendorName.substring(0, MAX_VENDOR_NAME_UTF8_BYTES);
+            }
+        }
+        return vendorName;
+    }
+
+    static String getModelName(Resources resources, MockableSystemProperties systemProperties) {
+        final String PROP_MODEL = "ro.product.model";
+        String modelName = resources.getString(R.string.config_thread_model_name);
+        if (modelName.equalsIgnoreCase(PROP_MODEL)) {
+            modelName = systemProperties.get(PROP_MODEL);
+            // Assume it's always ASCII chars in ro.product.model
+            if (modelName.length() > MAX_MODEL_NAME_UTF8_BYTES) {
+                modelName = modelName.substring(0, MAX_MODEL_NAME_UTF8_BYTES);
+            }
+        }
+        return modelName;
+    }
+
     @VisibleForTesting
-    static MeshcopTxtAttributes getMeshcopTxtAttributes(Resources resources) {
-        final String modelName = resources.getString(R.string.config_thread_model_name);
-        final String vendorName = resources.getString(R.string.config_thread_vendor_name);
+    static MeshcopTxtAttributes getMeshcopTxtAttributes(
+            Resources resources, MockableSystemProperties systemProperties) {
+        final String vendorName = getVendorName(resources, systemProperties);
+        final String modelName = getModelName(resources, systemProperties);
         final String vendorOui = resources.getString(R.string.config_thread_vendor_oui);
         final String[] vendorSpecificTxts =
                 resources.getStringArray(R.array.config_thread_mdns_vendor_specific_txts);
@@ -559,7 +591,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
             // The persistent setting keeps the desired enabled state, thus it's set regardless
             // the otDaemon set enabled state operation succeeded or not, so that it can recover
             // to the desired value after reboot.
-            mPersistentSettings.put(ThreadPersistentSettings.THREAD_ENABLED.key, isEnabled);
+            mPersistentSettings.put(ThreadPersistentSettings.KEY_THREAD_ENABLED, isEnabled);
         }
 
         try {
@@ -623,12 +655,22 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
         mNat64CidrController.maybeUpdateNat64Cidr();
     }
 
-    private static OtDaemonConfiguration newOtDaemonConfig(
-            @NonNull ThreadConfiguration threadConfig) {
+    private OtDaemonConfiguration newOtDaemonConfig(ThreadConfiguration threadConfig) {
+        int srpServerConfig = R.bool.config_thread_srp_server_wait_for_border_routing_enabled;
+        boolean srpServerWaitEnabled = mResources.get().getBoolean(srpServerConfig);
+        int autoJoinConfig = R.bool.config_thread_border_router_auto_join_enabled;
+        boolean autoJoinEnabled = mResources.get().getBoolean(autoJoinConfig);
+        boolean countryCodeEnabled =
+                mResources.get().getBoolean(R.bool.config_thread_country_code_enabled);
         return new OtDaemonConfiguration.Builder()
                 .setBorderRouterEnabled(threadConfig.isBorderRouterEnabled())
                 .setNat64Enabled(threadConfig.isNat64Enabled())
                 .setDhcpv6PdEnabled(threadConfig.isDhcpv6PdEnabled())
+                .setSrpServerWaitForBorderRoutingEnabled(srpServerWaitEnabled)
+                .setBorderRouterAutoJoinEnabled(autoJoinEnabled)
+                .setCountryCodeEnabled(countryCodeEnabled)
+                .setVendorName(getVendorName(mResources.get(), mSystemProperties))
+                .setModelName(getModelName(mResources.get(), mSystemProperties))
                 .build();
     }
 
@@ -738,7 +780,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
     private boolean shouldEnableThread() {
         return !mForceStopOtDaemonEnabled
                 && !mUserRestricted
-                && mPersistentSettings.get(ThreadPersistentSettings.THREAD_ENABLED);
+                && mPersistentSettings.get(ThreadPersistentSettings.KEY_THREAD_ENABLED);
     }
 
     private void requestUpstreamNetwork() {
@@ -874,10 +916,8 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
                         .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VCN_MANAGED);
         final var scoreBuilder = new NetworkScore.Builder();
 
-        if (isBorderRouterMode()) {
-            netCapsBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_LOCAL_NETWORK);
-            scoreBuilder.setKeepConnectedReason(NetworkScore.KEEP_CONNECTED_LOCAL_NETWORK);
-        }
+        netCapsBuilder.addCapability(NetworkCapabilities.NET_CAPABILITY_LOCAL_NETWORK);
+        scoreBuilder.setKeepConnectedReason(NetworkScore.KEEP_CONNECTED_LOCAL_NETWORK);
 
         return new NetworkAgent(
                 mContext,
@@ -885,7 +925,7 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
                 LOG.getTag(),
                 netCapsBuilder.build(),
                 getTunIfLinkProperties(),
-                isBorderRouterMode() ? newLocalNetworkConfig() : null,
+                newLocalNetworkConfig(),
                 scoreBuilder.build(),
                 new NetworkAgentConfig.Builder().build(),
                 mNetworkProvider) {
@@ -894,9 +934,8 @@ final class ThreadNetworkControllerService extends IThreadNetworkController.Stub
             @Override
             public void onNetworkUnwanted() {
                 LOG.i("Thread network is unwanted by ConnectivityService");
-                if (!isBorderRouterMode()) {
-                    leave(false /* eraseDataset */, new LoggingOperationReceiver("leave"));
-                }
+                // TODO(b/374037595): leave() the current network when the new APIs for mobile
+                // is available
             }
         };
     }

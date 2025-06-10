@@ -71,6 +71,7 @@ import static com.android.server.ConnectivityStatsLog.NETWORK_BPF_MAP_INFO;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -99,6 +100,7 @@ import androidx.test.filters.SmallTest;
 
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.IBpfMap;
+import com.android.net.module.util.Struct.Bool;
 import com.android.net.module.util.Struct.S32;
 import com.android.net.module.util.Struct.U32;
 import com.android.net.module.util.Struct.U8;
@@ -106,6 +108,8 @@ import com.android.net.module.util.bpf.CookieTagMapKey;
 import com.android.net.module.util.bpf.CookieTagMapValue;
 import com.android.net.module.util.bpf.IngressDiscardKey;
 import com.android.net.module.util.bpf.IngressDiscardValue;
+import com.android.net.module.util.bpf.LocalNetAccessKey;
+import com.android.server.connectivity.InterfaceTracker;
 import com.android.testutils.DevSdkIgnoreRule;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreAfter;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo;
@@ -167,10 +171,16 @@ public final class BpfNetMapsTest {
     @Mock INetd mNetd;
     @Mock BpfNetMaps.Dependencies mDeps;
     @Mock Context mContext;
+
+    @Mock InterfaceTracker mInterfaceTracker;
     private final IBpfMap<S32, U32> mConfigurationMap = new TestBpfMap<>(S32.class, U32.class);
     private final IBpfMap<S32, UidOwnerValue> mUidOwnerMap =
             new TestBpfMap<>(S32.class, UidOwnerValue.class);
     private final IBpfMap<S32, U8> mUidPermissionMap = new TestBpfMap<>(S32.class, U8.class);
+    private final IBpfMap<U32, Bool> mLocalNetBlockedUidMap =
+            new TestBpfMap<>(U32.class, Bool.class);
+    private final IBpfMap<LocalNetAccessKey, Bool> mLocalNetAccessMap =
+            new TestBpfMap<>(LocalNetAccessKey.class, Bool.class);
     private final IBpfMap<CookieTagMapKey, CookieTagMapValue> mCookieTagMap =
             spy(new TestBpfMap<>(CookieTagMapKey.class, CookieTagMapValue.class));
     private final IBpfMap<S32, U8> mDataSaverEnabledMap = new TestBpfMap<>(S32.class, U8.class);
@@ -181,6 +191,7 @@ public final class BpfNetMapsTest {
     public void setUp() throws Exception {
         MockitoAnnotations.initMocks(this);
         doReturn(TEST_IF_INDEX).when(mDeps).getIfIndex(TEST_IF_NAME);
+        doReturn(TEST_IF_INDEX).when(mInterfaceTracker).getInterfaceIndex(TEST_IF_NAME);
         doReturn(TEST_IF_NAME).when(mDeps).getIfName(TEST_IF_INDEX);
         doReturn(0).when(mDeps).synchronizeKernelRCU();
         BpfNetMaps.setConfigurationMapForTest(mConfigurationMap);
@@ -189,11 +200,13 @@ public final class BpfNetMapsTest {
                 CURRENT_STATS_MAP_CONFIGURATION_KEY, new U32(STATS_SELECT_MAP_A));
         BpfNetMaps.setUidOwnerMapForTest(mUidOwnerMap);
         BpfNetMaps.setUidPermissionMapForTest(mUidPermissionMap);
+        BpfNetMaps.setLocalNetAccessMapForTest(mLocalNetAccessMap);
+        BpfNetMaps.setLocalNetBlockedUidMapForTest(mLocalNetBlockedUidMap);
         BpfNetMaps.setCookieTagMapForTest(mCookieTagMap);
         BpfNetMaps.setDataSaverEnabledMapForTest(mDataSaverEnabledMap);
         mDataSaverEnabledMap.updateEntry(DATA_SAVER_ENABLED_KEY, new U8(DATA_SAVER_DISABLED));
         BpfNetMaps.setIngressDiscardMapForTest(mIngressDiscardMap);
-        mBpfNetMaps = new BpfNetMaps(mContext, mNetd, mDeps);
+        mBpfNetMaps = new BpfNetMaps(mContext, mNetd, mDeps, mInterfaceTracker);
     }
 
     @Test
@@ -232,6 +245,225 @@ public final class BpfNetMapsTest {
 
     private void doTestIsChainEnabled(final int enableChain) throws Exception {
         doTestIsChainEnabled(List.of(enableChain));
+    }
+
+    @Test
+    @IgnoreAfter(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testAddLocalNetAccessBeforeV() {
+        assertThrows(UnsupportedOperationException.class, () ->
+                mBpfNetMaps.addLocalNetAccess(0, TEST_IF_NAME, Inet6Address.ANY, 0, 0, true));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testAddLocalNetAccessAfterV() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mBpfNetMaps.addLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("196.68.0.0"), 0, 0, true);
+
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+        assertNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("100.68.0.0"), 0, 0)));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testAddLocalNetAccessWithNullInterfaceAfterV() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mBpfNetMaps.addLocalNetAccess(160, null,
+                Inet4Address.getByName("196.68.0.0"), 0, 0, true);
+
+        // As we tried to add null interface, it would be skipped and map should be empty.
+        assertTrue(mLocalNetAccessMap.isEmpty());
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testAddLocalNetAccessAfterVWithIncorrectInterface() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        // wlan2 is an incorrect interface
+        mBpfNetMaps.addLocalNetAccess(160, "wlan2",
+                Inet4Address.getByName("196.68.0.0"), 0, 0, true);
+
+        // As we tried to add incorrect interface, it would be skipped and map should be empty.
+        assertTrue(mLocalNetAccessMap.isEmpty());
+    }
+
+    @Test
+    @IgnoreAfter(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testGetLocalNetAccessBeforeV() {
+        assertThrows(UnsupportedOperationException.class, () ->
+                mBpfNetMaps.getLocalNetAccess(0, TEST_IF_NAME, Inet6Address.ANY, 0, 0));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testGetLocalNetAccessAfterV() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mLocalNetAccessMap.updateEntry(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0),
+                new Bool(false));
+
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+
+        assertFalse(mBpfNetMaps.getLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("196.68.0.0"), 0, 0));
+        assertTrue(mBpfNetMaps.getLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("100.68.0.0"), 0, 0));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testGetLocalNetAccessWithNullInterfaceAfterV() throws Exception {
+        assertTrue(mBpfNetMaps.getLocalNetAccess(160, null,
+                Inet4Address.getByName("100.68.0.0"), 0, 0));
+    }
+
+    @Test
+    @IgnoreAfter(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testRemoveLocalNetAccessBeforeV() {
+        assertThrows(UnsupportedOperationException.class, () ->
+                mBpfNetMaps.removeLocalNetAccess(0, TEST_IF_NAME, Inet6Address.ANY, 0, 0));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testRemoveLocalNetAccessAfterV() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mBpfNetMaps.addLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("196.68.0.0"), 0, 0, true);
+
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+        assertNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("100.68.0.0"), 0, 0)));
+
+        mBpfNetMaps.removeLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("196.68.0.0"), 0, 0);
+        assertNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+        assertNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("100.68.0.0"), 0, 0)));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testRemoveLocalNetAccessAfterVWithIncorrectInterface() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mBpfNetMaps.addLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("196.68.0.0"), 0, 0, true);
+
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+        assertNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("100.68.0.0"), 0, 0)));
+
+        mBpfNetMaps.removeLocalNetAccess(160, "wlan2",
+                Inet4Address.getByName("196.68.0.0"), 0, 0);
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testRemoveLocalNetAccessAfterVWithNullInterface() throws Exception {
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mBpfNetMaps.addLocalNetAccess(160, TEST_IF_NAME,
+                Inet4Address.getByName("196.68.0.0"), 0, 0, true);
+
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+        assertNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("100.68.0.0"), 0, 0)));
+
+        mBpfNetMaps.removeLocalNetAccess(160, null,
+                Inet4Address.getByName("196.68.0.0"), 0, 0);
+        assertNotNull(mLocalNetAccessMap.getValue(new LocalNetAccessKey(160, TEST_IF_INDEX,
+                Inet4Address.getByName("196.68.0.0"), 0, 0)));
+    }
+
+    @Test
+    @IgnoreAfter(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testAddUidToLocalNetBlockMapBeforeV() {
+        assertThrows(UnsupportedOperationException.class, () ->
+                mBpfNetMaps.addUidToLocalNetBlockMap(0));
+    }
+
+    @Test
+    @IgnoreAfter(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testIsUidBlockedFromUsingLocalNetworkBeforeV() {
+        assertThrows(UnsupportedOperationException.class, () ->
+                mBpfNetMaps.isUidBlockedFromUsingLocalNetwork(0));
+    }
+
+    @Test
+    @IgnoreAfter(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testRemoveUidFromLocalNetBlockMapBeforeV() {
+        assertThrows(UnsupportedOperationException.class, () ->
+                mBpfNetMaps.removeUidFromLocalNetBlockMap(0));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testAddUidFromLocalNetBlockMapAfterV() throws Exception {
+        final int uid0 = TEST_UIDS[0];
+        final int uid1 = TEST_UIDS[1];
+
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mBpfNetMaps.addUidToLocalNetBlockMap(uid0);
+        assertTrue(mLocalNetBlockedUidMap.getValue(new U32(uid0)).val);
+        assertNull(mLocalNetBlockedUidMap.getValue(new U32(uid1)));
+
+        mBpfNetMaps.addUidToLocalNetBlockMap(uid1);
+        assertTrue(mLocalNetBlockedUidMap.getValue(new U32(uid1)).val);
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testIsUidBlockedFromUsingLocalNetworkAfterV() throws Exception {
+        final int uid0 = TEST_UIDS[0];
+        final int uid1 = TEST_UIDS[1];
+
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mLocalNetBlockedUidMap.updateEntry(new U32(uid0), new Bool(true));
+        assertTrue(mBpfNetMaps.isUidBlockedFromUsingLocalNetwork(uid0));
+        assertFalse(mBpfNetMaps.isUidBlockedFromUsingLocalNetwork(uid1));
+
+        mLocalNetBlockedUidMap.updateEntry(new U32(uid1), new Bool(true));
+        assertTrue(mBpfNetMaps.isUidBlockedFromUsingLocalNetwork(uid1));
+    }
+
+    @Test
+    @IgnoreUpTo(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    public void testRemoveUidFromLocalNetBlockMapAfterV() throws Exception {
+        final int uid0 = TEST_UIDS[0];
+        final int uid1 = TEST_UIDS[1];
+
+        assertTrue(mLocalNetAccessMap.isEmpty());
+
+        mLocalNetBlockedUidMap.updateEntry(new U32(uid0), new Bool(true));
+        mLocalNetBlockedUidMap.updateEntry(new U32(uid1), new Bool(true));
+
+        assertTrue(mLocalNetBlockedUidMap.getValue(new U32(uid0)).val);
+        assertTrue(mLocalNetBlockedUidMap.getValue(new U32(uid1)).val);
+
+        mBpfNetMaps.removeUidFromLocalNetBlockMap(uid0);
+        assertNull(mLocalNetBlockedUidMap.getValue(new U32(uid0)));
+        assertTrue(mLocalNetBlockedUidMap.getValue(new U32(uid1)).val);
+
+        mBpfNetMaps.removeUidFromLocalNetBlockMap(uid1);
+        assertNull(mLocalNetBlockedUidMap.getValue(new U32(uid1)));
     }
 
     @Test

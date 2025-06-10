@@ -25,6 +25,12 @@ import static android.net.NetworkCapabilities.TRANSPORT_ETHERNET;
 import static android.net.NetworkCapabilities.TRANSPORT_TEST;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
 import static android.net.NetworkCapabilities.transportNamesOf;
+import static android.system.OsConstants.EEXIST;
+import static android.system.OsConstants.EIO;
+import static android.system.OsConstants.ENOENT;
+
+import static com.android.net.module.util.FrameworkConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED;
+import static com.android.net.module.util.FrameworkConnectivityStatsLog.CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_DISALLOW_BYPASS_VPN_FOR_DELEGATE_UID_ENOENT;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
@@ -56,10 +62,13 @@ import android.net.QosSession;
 import android.net.TcpKeepalivePacketData;
 import android.os.Handler;
 import android.os.IBinder;
+import android.os.Message;
 import android.os.RemoteException;
+import android.os.ServiceSpecificException;
 import android.os.SystemClock;
 import android.telephony.data.EpsBearerQosSessionAttributes;
 import android.telephony.data.NrQosSessionAttributes;
+import android.util.ArrayMap;
 import android.util.ArraySet;
 import android.util.Log;
 import android.util.Pair;
@@ -68,8 +77,10 @@ import android.util.SparseArray;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.util.IndentingPrintWriter;
 import com.android.internal.util.WakeupMessage;
+import com.android.net.module.util.FrameworkConnectivityStatsLog;
 import com.android.net.module.util.HandlerUtils;
 import com.android.server.ConnectivityService;
+import com.android.server.ConnectivityService.CaptivePortalImpl;
 
 import java.io.PrintWriter;
 import java.net.Inet4Address;
@@ -82,6 +93,7 @@ import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.function.Consumer;
 
 /**
  * A bag class used by ConnectivityService for holding a collection of most recent
@@ -574,6 +586,10 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
     // For fast lookups. Indexes into mInactivityTimers by request ID.
     private final SparseArray<InactivityTimer> mInactivityTimerForRequest = new SparseArray<>();
 
+    // Map of delegated UIDs used to bypass VPN and its captive portal app caller.
+    private final ArrayMap<CaptivePortalImpl, Integer> mCaptivePortalDelegateUids =
+            new ArrayMap<>();
+
     // Inactivity expiry timer. Armed whenever mInactivityTimers is non-empty, regardless of
     // whether the network is inactive or not. Always set to the expiry of the mInactivityTimers
     // that expires last. When the timer fires, all inactivity state is cleared, and if the network
@@ -616,6 +632,7 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
     // Used by ConnectivityService to keep track of 464xlat.
     public final Nat464Xlat clatd;
 
+    private final ArrayList<Message> mMessagesPendingRegistration = new ArrayList<>();
     // Set after asynchronous creation of the NetworkMonitor.
     private volatile NetworkMonitorManager mNetworkMonitor;
 
@@ -625,7 +642,9 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
     private final ConnectivityService.Dependencies mConnServiceDeps;
     private final Context mContext;
     private final Handler mHandler;
+    private final NetworkAgentMessageHandler mRegistry;
     private final QosCallbackTracker mQosCallbackTracker;
+    private final INetd mNetd;
 
     private final long mCreationTime;
 
@@ -655,8 +674,10 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
         mConnServiceDeps = deps;
         setScore(score); // uses members connService, networkCapabilities and networkAgentConfig
         clatd = new Nat464Xlat(this, netd, dnsResolver, deps);
+        mNetd = netd;
         mContext = context;
         mHandler = handler;
+        mRegistry = new NetworkAgentMessageHandler(mHandler);
         this.factorySerialNumber = factorySerialNumber;
         this.creatorUid = creatorUid;
         mLingerDurationMs = lingerDurationMs;
@@ -682,10 +703,12 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
      * Must be called from the ConnectivityService handler thread. A NetworkAgent can only be
      * registered once.
      */
-    public void notifyRegistered() {
+    public void notifyRegistered(final INetworkMonitor nm) {
+        HandlerUtils.ensureRunningOnHandlerThread(mHandler);
+        mNetworkMonitor = new NetworkMonitorManager(nm);
         try {
             networkAgent.asBinder().linkToDeath(mDeathMonitor, 0);
-            networkAgent.onRegistered(new NetworkAgentMessageHandler(mHandler));
+            networkAgent.onRegistered();
         } catch (RemoteException e) {
             Log.e(TAG, "Error registering NetworkAgent", e);
             maybeUnlinkDeathMonitor();
@@ -695,6 +718,41 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
         }
 
         mHandler.obtainMessage(EVENT_AGENT_REGISTERED, ARG_AGENT_SUCCESS, 0, this).sendToTarget();
+    }
+
+    /**
+     * Pass all enqueued messages to the message processor argument, and clear the queue.
+     *
+     * This is called by ConnectivityService when it is ready to receive messages for this
+     * network agent. The processor may process the messages synchronously or asynchronously
+     * at its option.
+     *
+     * @param messageProcessor a function to process the messages
+     */
+    public void processEnqueuedMessages(final Consumer<Message> messageProcessor) {
+        for (final Message enqueued : mMessagesPendingRegistration) {
+            messageProcessor.accept(enqueued);
+        }
+        mMessagesPendingRegistration.clear();
+    }
+
+    /**
+     * Enqueues a message if it needs to be enqueued, and returns whether it was enqueued.
+     *
+     * The message is enqueued iff it can't be sent just yet. If it can be sent
+     * immediately, this method returns false and doesn't enqueue.
+     *
+     * If it enqueues, this method will make a copy of the message for enqueuing since
+     * messages can't be reused or recycled before the end of their processing by the
+     * handler.
+     */
+    public boolean maybeEnqueueMessage(final Message msg) {
+        HandlerUtils.ensureRunningOnHandlerThread(mHandler);
+        if (null != mNetworkMonitor) return false;
+        final Message m = mHandler.obtainMessage();
+        m.copyFrom(msg);
+        mMessagesPendingRegistration.add(m);
+        return true;
     }
 
     /**
@@ -1020,13 +1078,6 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
     }
 
     /**
-     * Inform NetworkAgentInfo that a new NetworkMonitor was created.
-     */
-    public void onNetworkMonitorCreated(INetworkMonitor networkMonitor) {
-        mNetworkMonitor = new NetworkMonitorManager(networkMonitor);
-    }
-
-    /**
      * Set the NetworkCapabilities on this NetworkAgentInfo. Also attempts to notify NetworkMonitor
      * of the new capabilities, if NetworkMonitor has been created.
      *
@@ -1101,6 +1152,13 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
         return mNetworkMonitor;
     }
 
+    /**
+     * Get the registry in this NetworkAgentInfo.
+     */
+    public INetworkAgentRegistry getRegistry() {
+        return mRegistry;
+    }
+
     // Functions for manipulating the requests satisfied by this network.
     //
     // These functions must only called on ConnectivityService's main thread.
@@ -1112,6 +1170,7 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
         int delta = add ? +1 : -1;
         switch (request.type) {
             case REQUEST:
+            case RESERVATION:
                 mNumRequestNetworkRequests += delta;
                 break;
 
@@ -1547,6 +1606,58 @@ public class NetworkAgentInfo implements NetworkRanker.Scoreable {
                 nc, hasAutomotiveFeature, deps, authenticator)) {
             nc.setAllowedUids(new ArraySet<>());
         }
+    }
+
+    private int allowBypassVpnOnNetwork(boolean allow, int uid, int netId) {
+        try {
+            mNetd.networkAllowBypassVpnOnNetwork(allow, uid, netId);
+            return 0;
+        } catch (RemoteException e) {
+            // Netd has crashed, and this process is about to crash as well.
+            return EIO;
+        } catch (ServiceSpecificException e) {
+            return e.errorCode;
+        }
+    }
+
+    /**
+     * Set the delegate UID of the app that is allowed to perform network traffic for captive
+     * portal login, and configure the netd bypass rule with this delegated UID.
+     *
+     * @param caller the captive portal app to that delegated UID
+     * @param uid the delegated UID of the captive portal app.
+     * @return Return 0 if set the UID and VPN bypass rule successfully or bypass rule corresponding
+     *                to this UID already exists otherwise return errno.
+     */
+    public int setCaptivePortalDelegateUid(@NonNull final CaptivePortalImpl caller, int uid) {
+        final int errorCode = allowBypassVpnOnNetwork(true /* allow */, uid, network.netId);
+        if (errorCode == 0 || errorCode == EEXIST) {
+            mCaptivePortalDelegateUids.put(caller, uid);
+        }
+        return errorCode == EEXIST ? 0 : errorCode;
+    }
+
+    /**
+     * Remove the delegate UID of the app that is allowed to perform network traffic for captive
+     * portal login, and remove the netd bypass rule if no other caller is delegating this UID.
+     *
+     * @param caller the captive portal app to that delegated UID.
+     * @return Return 0 if remove the UID and VPN bypass rule successfully or bypass rule
+     *                corresponding to this UID doesn't exist otherwise return errno.
+     */
+    public int removeCaptivePortalDelegateUid(@NonNull final CaptivePortalImpl caller) {
+        final Integer maybeDelegateUid = mCaptivePortalDelegateUids.remove(caller);
+        if (maybeDelegateUid == null) return 0;
+        if (mCaptivePortalDelegateUids.values().contains(maybeDelegateUid)) return 0;
+        final int errorCode =
+                allowBypassVpnOnNetwork(false /* allow */, maybeDelegateUid, network.netId);
+        if (errorCode == ENOENT) {
+            FrameworkConnectivityStatsLog.write(
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED,
+                    CORE_NETWORKING_TERRIBLE_ERROR_OCCURRED__ERROR_TYPE__TYPE_DISALLOW_BYPASS_VPN_FOR_DELEGATE_UID_ENOENT
+            );
+        }
+        return errorCode == ENOENT ? 0 : errorCode;
     }
 
     private static boolean areAllowedUidsAcceptableFromNetworkAgent(

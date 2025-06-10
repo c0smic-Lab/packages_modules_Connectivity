@@ -56,6 +56,7 @@ import static android.net.NetworkCapabilities.TRANSPORT_CELLULAR;
 import static android.net.NetworkCapabilities.TRANSPORT_ETHERNET;
 import static android.net.NetworkCapabilities.TRANSPORT_SATELLITE;
 import static android.net.NetworkCapabilities.TRANSPORT_TEST;
+import static android.net.NetworkCapabilities.TRANSPORT_THREAD;
 import static android.net.NetworkCapabilities.TRANSPORT_USB;
 import static android.net.NetworkCapabilities.TRANSPORT_VPN;
 import static android.net.NetworkCapabilities.TRANSPORT_WIFI;
@@ -382,6 +383,7 @@ public class NetworkCapabilitiesTest {
             netCap.setAllowedUids(allowedUids);
             netCap.setSubscriptionIds(Set.of(TEST_SUBID1, TEST_SUBID2));
             netCap.setUids(uids);
+            netCap.setReservationId(42);
         }
 
         netCap.setOwnerUid(123);
@@ -1492,5 +1494,132 @@ public class NetworkCapabilitiesTest {
 
         // nc1 and nc2 are the same since invalid capability is ignored
         assertEquals(nc1, nc2);
+    }
+
+    @Test
+    public void testReservationIdMatching() {
+        final NetworkCapabilities requestNc = new NetworkCapabilities();
+        final NetworkCapabilities reservationNc = new NetworkCapabilities();
+        reservationNc.setReservationId(42);
+
+        final NetworkCapabilities reservedNetworkNc = new NetworkCapabilities(reservationNc);
+        final NetworkCapabilities otherNetworkNc = new NetworkCapabilities();
+        final NetworkCapabilities otherReservedNetworkNc = new NetworkCapabilities();
+        otherReservedNetworkNc.setReservationId(99);
+        final NetworkCapabilities offerNc = new NetworkCapabilities();
+        offerNc.setReservationId(NetworkCapabilities.RES_ID_MATCH_ALL_RESERVATIONS);
+
+        // A regular request can match any network or offer except one with MATCH_ALL_RESERVATIONS
+        assertTrue(requestNc.satisfiedByNetworkCapabilities(reservedNetworkNc));
+        assertTrue(requestNc.satisfiedByNetworkCapabilities(otherNetworkNc));
+        assertTrue(requestNc.satisfiedByNetworkCapabilities(otherReservedNetworkNc));
+        assertFalse(requestNc.satisfiedByNetworkCapabilities(offerNc));
+
+        // A reservation request can only match the reservedNetwork and the blanket offer.
+        assertTrue(reservationNc.satisfiedByNetworkCapabilities(reservedNetworkNc));
+        assertFalse(reservationNc.satisfiedByNetworkCapabilities(otherNetworkNc));
+        assertFalse(reservationNc.satisfiedByNetworkCapabilities(otherReservedNetworkNc));
+        assertTrue(reservationNc.satisfiedByNetworkCapabilities(offerNc));
+    }
+
+    @Test @IgnoreUpTo(SC_V2)
+    public void testReservationIdEquals() {
+        final NetworkCapabilities nc = new NetworkCapabilities();
+        nc.setReservationId(42);
+        final NetworkCapabilities other = new NetworkCapabilities(nc);
+
+        assertEquals(nc, other);
+
+        nc.setReservationId(43);
+        assertNotEquals(nc, other);
+    }
+
+    @Test
+    public void testMatchNonThreadLocalNetworks_equals() {
+        final NetworkCapabilities nc = new NetworkCapabilities();
+        nc.setMatchNonThreadLocalNetworks(true);
+        final NetworkCapabilities other = new NetworkCapabilities(nc);
+        assertEquals(nc, other);
+
+        nc.setMatchNonThreadLocalNetworks(false);
+        assertNotEquals(nc, other);
+    }
+
+    @Test
+    public void testMatchNonThreadLocalNetworks_enabled() {
+        doTestMatchNonThreadLocalNetworks(true);
+    }
+
+    @Test
+    public void testMatchNonThreadLocalNetworks_disabled() {
+        doTestMatchNonThreadLocalNetworks(false);
+    }
+
+    private void doTestMatchNonThreadLocalNetworks(boolean enabled) {
+        // Setup request NCs.
+        final NetworkCapabilities noTransportRequestNc = new NetworkCapabilities();
+        final NetworkCapabilities threadRequestNc =
+                new NetworkCapabilities.Builder().addTransportType(TRANSPORT_THREAD).build();
+        final NetworkCapabilities wifiRequestNc =
+                new NetworkCapabilities.Builder().addTransportType(TRANSPORT_WIFI).build();
+        final NetworkCapabilities multiTransportRequestNc =
+                new NetworkCapabilities.Builder().addTransportType(
+                        TRANSPORT_THREAD).addTransportType(TRANSPORT_WIFI).build();
+
+        // Setup network NCs.
+        final NetworkCapabilities localNoTransportNc = new NetworkCapabilities.Builder()
+                .addCapability(NET_CAPABILITY_LOCAL_NETWORK).build();
+        final NetworkCapabilities localThreadsNc = new NetworkCapabilities.Builder()
+                .addCapability(NET_CAPABILITY_LOCAL_NETWORK)
+                .addTransportType(TRANSPORT_THREAD).build();
+        final NetworkCapabilities localWifiNc = new NetworkCapabilities.Builder()
+                .addCapability(NET_CAPABILITY_LOCAL_NETWORK)
+                .addTransportType(TRANSPORT_WIFI).build();
+        final NetworkCapabilities wanWifiNc = new NetworkCapabilities.Builder()
+                .addTransportType(TRANSPORT_WIFI).build();
+
+        // Mark flags accordingly.
+        noTransportRequestNc.setMatchNonThreadLocalNetworks(enabled);
+        threadRequestNc.setMatchNonThreadLocalNetworks(enabled);
+        wifiRequestNc.setMatchNonThreadLocalNetworks(enabled);
+        multiTransportRequestNc.setMatchNonThreadLocalNetworks(enabled);
+
+        if (enabled) {
+            // A request with no specific transport matches all networks.
+            assertTrue(noTransportRequestNc.satisfiedByNetworkCapabilities(localNoTransportNc));
+            assertTrue(noTransportRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        } else {
+            // A request with no specific transport only matches thread networks.
+            assertFalse(noTransportRequestNc.satisfiedByNetworkCapabilities(localNoTransportNc));
+            assertFalse(noTransportRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        }
+        assertTrue(noTransportRequestNc.satisfiedByNetworkCapabilities(localThreadsNc));
+        assertTrue(noTransportRequestNc.satisfiedByNetworkCapabilities(wanWifiNc));
+
+        // A request with TRANSPORT_THREAD only matches thread networks.
+        assertFalse(threadRequestNc.satisfiedByNetworkCapabilities(localNoTransportNc));
+        assertTrue(threadRequestNc.satisfiedByNetworkCapabilities(localThreadsNc));
+        assertFalse(threadRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        assertFalse(threadRequestNc.satisfiedByNetworkCapabilities(wanWifiNc));
+
+        assertFalse(multiTransportRequestNc.satisfiedByNetworkCapabilities(localNoTransportNc));
+        assertTrue(multiTransportRequestNc.satisfiedByNetworkCapabilities(localThreadsNc));
+        assertTrue(multiTransportRequestNc.satisfiedByNetworkCapabilities(wanWifiNc));
+        if (enabled) {
+            assertTrue(multiTransportRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        } else {
+            // A request with multiple transports only matches thread networks.
+            assertFalse(multiTransportRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        }
+
+        assertFalse(wifiRequestNc.satisfiedByNetworkCapabilities(localNoTransportNc));
+        assertFalse(wifiRequestNc.satisfiedByNetworkCapabilities(localThreadsNc));
+        assertTrue(wifiRequestNc.satisfiedByNetworkCapabilities(wanWifiNc));
+        if (enabled) {
+            assertTrue(wifiRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        } else {
+            // A request without TRANSPORT_THREAD matches nothing.
+            assertFalse(wifiRequestNc.satisfiedByNetworkCapabilities(localWifiNc));
+        }
     }
 }

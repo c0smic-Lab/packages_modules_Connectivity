@@ -24,6 +24,7 @@ import static android.net.ConnectivityManager.TYPE_MOBILE_HIPRI;
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
 import static com.android.networkstack.apishim.ConstantsShim.KEY_CARRIER_SUPPORTS_TETHERING_BOOL;
+import static com.android.net.module.util.SdkUtil.isAtLeast25Q2;
 
 import android.content.ContentResolver;
 import android.content.Context;
@@ -130,9 +131,6 @@ public class TetheringConfiguration {
     public static final String TETHER_ENABLE_WEAR_TETHERING =
             "tether_enable_wear_tethering";
 
-    public static final String TETHER_FORCE_RANDOM_PREFIX_BASE_SELECTION =
-            "tether_force_random_prefix_base_selection";
-
     public static final String TETHER_ENABLE_SYNC_SM = "tether_enable_sync_sm";
 
     /**
@@ -142,13 +140,19 @@ public class TetheringConfiguration {
     public static final int DEFAULT_TETHER_OFFLOAD_POLL_INTERVAL_MS = 5000;
 
     /** A flag for using synchronous or asynchronous state machine. */
-    public static boolean USE_SYNC_SM = false;
+    public static boolean USE_SYNC_SM = true;
 
     /**
      * A feature flag to control whether the active sessions metrics should be enabled.
      * Disabled by default.
      */
     public static final String TETHER_ACTIVE_SESSIONS_METRICS = "tether_active_sessions_metrics";
+
+    /**
+     * A feature flag to control whether the tethering local network agent should be enabled.
+     * Disabled by default.
+     */
+    public static final String TETHERING_LOCAL_NETWORK_AGENT = "tethering_local_network_agent";
 
     public final String[] tetherableUsbRegexs;
     public final String[] tetherableWifiRegexs;
@@ -193,6 +197,10 @@ public class TetheringConfiguration {
     public static class Dependencies {
         boolean isFeatureEnabled(@NonNull Context context, @NonNull String name) {
             return DeviceConfigUtils.isTetheringFeatureEnabled(context, name);
+        }
+
+        boolean isFeatureNotChickenedOut(@NonNull Context context, @NonNull String name) {
+            return DeviceConfigUtils.isTetheringFeatureNotChickenedOut(context, name);
         }
 
         boolean getDeviceConfigBoolean(@NonNull String namespace, @NonNull String name,
@@ -394,7 +402,7 @@ public class TetheringConfiguration {
      * use the async state machine.
      */
     public void readEnableSyncSM(final Context ctx) {
-        USE_SYNC_SM = mDeps.isFeatureEnabled(ctx, TETHER_ENABLE_SYNC_SM);
+        USE_SYNC_SM = isAtLeast25Q2() || mDeps.isFeatureNotChickenedOut(ctx, TETHER_ENABLE_SYNC_SM);
     }
 
     /** Does the dumping.*/

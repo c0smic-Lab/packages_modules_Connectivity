@@ -16,50 +16,22 @@
 
 package com.android.net.module.util;
 
-import android.os.Process;
+import android.system.ErrnoException;
 import android.util.Log;
-
-import java.io.IOException;
 
 /**
  * Contains mostly timerfd functionality.
  */
 public class TimerFdUtils {
-    static {
-        final String jniLibName = JniUtil.getJniLibraryName(TimerFdUtils.class.getPackage());
-        if (jniLibName.equals("android_net_connectivity_com_android_net_module_util_jni")) {
-            // This library is part of service-connectivity.jar when in the system server,
-            // so libservice-connectivity.so is the library to load.
-            System.loadLibrary("service-connectivity");
-        } else {
-            System.loadLibrary(jniLibName);
-        }
-    }
-
     private static final String TAG = TimerFdUtils.class.getSimpleName();
-
-    /**
-     * Create a timerfd.
-     *
-     * @throws IOException if the timerfd creation is failed.
-     */
-    private static native int createTimerFd() throws IOException;
-
-    /**
-     * Set given time to the timerfd.
-     *
-     * @param timeMs target time
-     * @throws IOException if setting expiration time is failed.
-     */
-    private static native void setTime(int fd, long timeMs) throws IOException;
 
     /**
      * Create a timerfd
      */
     static int createTimerFileDescriptor() {
         try {
-            return createTimerFd();
-        } catch (IOException e) {
+            return ServiceConnectivityJni.createTimerFd();
+        } catch (ErrnoException e) {
             Log.e(TAG, "createTimerFd failed", e);
             return -1;
         }
@@ -68,10 +40,10 @@ public class TimerFdUtils {
     /**
      * Set expiration time to timerfd
      */
-    static boolean setExpirationTime(int id, long expirationTimeMs) {
+    static boolean setExpirationTime(int fd, long expirationTimeMs) {
         try {
-            setTime(id, expirationTimeMs);
-        } catch (IOException e) {
+            ServiceConnectivityJni.setTimerFdTime(fd, expirationTimeMs);
+        } catch (ErrnoException e) {
             Log.e(TAG, "setExpirationTime failed", e);
             return false;
         }

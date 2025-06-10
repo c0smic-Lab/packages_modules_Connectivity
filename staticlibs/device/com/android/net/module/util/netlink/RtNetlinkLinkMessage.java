@@ -22,7 +22,6 @@ import static com.android.net.module.util.NetworkStackConstants.ETHER_ADDR_LEN;
 import static com.android.net.module.util.netlink.NetlinkConstants.IFF_UP;
 import static com.android.net.module.util.netlink.NetlinkConstants.RTM_GETLINK;
 import static com.android.net.module.util.netlink.NetlinkConstants.RTM_NEWLINK;
-import static com.android.net.module.util.netlink.StructNlMsgHdr.NLM_F_REQUEST;
 import static com.android.net.module.util.netlink.StructNlMsgHdr.NLM_F_REQUEST_ACK;
 
 import android.net.MacAddress;
@@ -307,9 +306,92 @@ public class RtNetlinkLinkMessage extends NetlinkMessage {
         }
 
         return RtNetlinkLinkMessage.build(
-                new StructNlMsgHdr(0, RTM_GETLINK, NLM_F_REQUEST, sequenceNumber),
+                new StructNlMsgHdr(0, RTM_GETLINK, NLM_F_REQUEST_ACK, sequenceNumber),
                 new StructIfinfoMsg((short) AF_UNSPEC, (short) 0, interfaceIndex, 0, 0),
                 DEFAULT_MTU, null, null);
+    }
+
+    /**
+     * Creates an {@link RtNetlinkLinkMessage} instance that can be used to set the flags of a
+     * network interface.
+     *
+     * @param interfaceName The name of the network interface to query.
+     * @param sequenceNumber The sequence number for the Netlink message.
+     * @param flags power-of-two integer flags to set or unset. A flag to set should be passed as
+     *        is as a power-of-two value, and a flag to remove should be passed inversed as -1 with
+     *        a single bit down. For example: IFF_UP, ~IFF_BROADCAST...
+     * @return An `RtNetlinkLinkMessage` instance representing the request to query the interface.
+     */
+    @Nullable
+    public static RtNetlinkLinkMessage createSetFlagsMessage(@NonNull String interfaceName,
+            int sequenceNumber, int... flags) {
+        return createSetFlagsMessage(
+                interfaceName, sequenceNumber, new OsAccess(), flags);
+    }
+
+    @VisibleForTesting
+    @Nullable
+    protected static RtNetlinkLinkMessage createSetFlagsMessage(
+            @NonNull String interfaceName, int sequenceNumber, @NonNull OsAccess osAccess,
+            int... flags) {
+        final int interfaceIndex = osAccess.if_nametoindex(interfaceName);
+        if (interfaceIndex == OsAccess.INVALID_INTERFACE_INDEX) {
+            return null;
+        }
+
+        int flagsBits = 0;
+        int changeBits = 0;
+        for (int f : flags) {
+            if (Integer.bitCount(f) == 1) {
+                flagsBits |= f;
+                changeBits |= f;
+            } else if (Integer.bitCount(~f) == 1) {
+                flagsBits &= f;
+                changeBits |= ~f;
+            } else {
+                return null;
+            }
+        }
+        // RTM_NEWLINK is used here for create, modify, or notify changes about a internet
+        // interface, including change in administrative state. While RTM_SETLINK is used to
+        // modify an existing link rather than creating a new one.
+        return RtNetlinkLinkMessage.build(
+                new StructNlMsgHdr(
+                        /*payloadLen*/ 0, RTM_NEWLINK, NLM_F_REQUEST_ACK, sequenceNumber),
+                new StructIfinfoMsg((short) AF_UNSPEC, /*type*/ 0, interfaceIndex,
+                        flagsBits, changeBits),
+                DEFAULT_MTU, /*hardwareAddress*/ null, /*interfaceName*/ null);
+    }
+
+    /**
+     * Creates an {@link RtNetlinkLinkMessage} instance that can be used to set the MTU of a
+     * network interface.
+     *
+     * @param interfaceName The name of the network interface to query.
+     * @param sequenceNumber The sequence number for the Netlink message.
+     * @param mtu MTU value to set for the interface.
+     * @return An `RtNetlinkLinkMessage` instance representing the request to query the interface.
+     */
+    @Nullable
+    public static RtNetlinkLinkMessage createSetMtuMessage(@NonNull String interfaceName,
+            int sequenceNumber, int mtu) {
+        return createSetMtuMessage(
+            interfaceName, sequenceNumber, mtu, new OsAccess());
+    }
+
+    @VisibleForTesting
+    @Nullable
+    protected static RtNetlinkLinkMessage createSetMtuMessage(@NonNull String interfaceName,
+            int sequenceNumber, int mtu, @NonNull OsAccess osAccess) {
+        final int interfaceIndex = osAccess.if_nametoindex(interfaceName);
+        if (interfaceIndex == OsAccess.INVALID_INTERFACE_INDEX) {
+            return null;
+        }
+        return RtNetlinkLinkMessage.build(
+            new StructNlMsgHdr(/*payloadLen*/ 0, RTM_NEWLINK, NLM_F_REQUEST_ACK , sequenceNumber),
+            new StructIfinfoMsg((short) AF_UNSPEC, /*type*/ 0, interfaceIndex,
+                /*flags*/ 0, /*change*/ 0),
+            mtu, /*hardwareAddress*/ null, /*interfaceName*/ null);
     }
 
     @Override

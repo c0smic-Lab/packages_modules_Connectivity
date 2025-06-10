@@ -51,6 +51,7 @@ import android.net.NetworkRequest
 import android.net.StaticIpConfiguration
 import android.net.TestNetworkInterface
 import android.net.TestNetworkManager
+import android.net.TestNetworkManager.TestInterfaceRequest
 import android.net.cts.EthernetManagerTest.EthernetStateListener.CallbackEntry.EthernetStateChanged
 import android.net.cts.EthernetManagerTest.EthernetStateListener.CallbackEntry.InterfaceStateChanged
 import android.os.Build
@@ -77,6 +78,7 @@ import com.android.testutils.TestableNetworkCallback
 import com.android.testutils.assertThrows
 import com.android.testutils.runAsShell
 import com.android.testutils.waitForIdle
+import com.google.common.truth.Truth.assertThat
 import java.io.IOException
 import java.net.Inet6Address
 import java.net.Socket
@@ -168,7 +170,12 @@ class EthernetManagerTest {
                 // false, it is subsequently disabled. This means that the interface may briefly get
                 // link. With IPv6 provisioning delays (RS delay and DAD) disabled, this can cause
                 // tests that expect no network to come up when hasCarrier is false to become flaky.
-                tnm.createTapInterface(hasCarrier, false /* bringUp */)
+                val req = TestInterfaceRequest.Builder()
+                        .setTap()
+                        .setHasCarrier(hasCarrier)
+                        .setBringUp(false)
+                        .build()
+                tnm.createTestInterface(req)
             }
             val mtu = tapInterface.mtu
             packetReader = PollPacketReader(
@@ -604,6 +611,9 @@ class EthernetManagerTest {
     }
 
     private fun assumeNoInterfaceForTetheringAvailable() {
+         // Requesting a tethered interface will stop IpClient. Prevent it from doing so
+         // if adb is connected over ethernet.
+         assumeFalse(isAdbOverEthernet())
         // Interfaces that have configured NetworkCapabilities will never be used for tethering,
         // see aosp/2123900.
         try {
@@ -1068,6 +1078,9 @@ class EthernetManagerTest {
 
     @Test
     fun testSetTetheringInterfaceMode_disableEnableEthernet() {
+        // do not run this test if an interface that can be used for tethering already exists.
+        assumeNoInterfaceForTetheringAvailable()
+
         val listener = EthernetStateListener()
         addInterfaceStateListener(listener)
 
@@ -1088,5 +1101,25 @@ class EthernetManagerTest {
         // When ethernet is re-enabled, interface will be brought up.
         setEthernetEnabled(true)
         listener.eventuallyExpect(iface, STATE_LINK_UP, ROLE_CLIENT)
+    }
+
+    @Test
+    fun testGetInterfaceList_disableEnableEthernet() {
+        // Test that interface list can be obtained when ethernet is disabled.
+        setEthernetEnabled(false)
+        // Create two test interfaces and check the return list contains the interface names.
+        val iface1 = createInterface()
+        val iface2 = createInterface()
+        var ifaces = em.getInterfaceList()
+        assertThat(ifaces).containsAtLeast(iface1.name, iface2.name)
+
+        // Remove one existing test interface and check the return list doesn't contain the
+        // removed interface name.
+        removeInterface(iface1)
+        ifaces = em.getInterfaceList()
+        assertThat(ifaces).doesNotContain(iface1.name)
+        assertThat(ifaces).contains(iface2.name)
+
+        removeInterface(iface2)
     }
 }

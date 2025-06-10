@@ -15,14 +15,23 @@
  */
 package com.android.server.net.ct;
 
+import static com.android.server.net.ct.CertificateTransparencyLogger.CTLogListUpdateState.PUBLIC_KEY_NOT_FOUND;
+import static com.android.server.net.ct.CertificateTransparencyLogger.CTLogListUpdateState.SIGNATURE_INVALID;
+import static com.android.server.net.ct.CertificateTransparencyLogger.CTLogListUpdateState.SIGNATURE_NOT_FOUND;
+import static com.android.server.net.ct.CertificateTransparencyLogger.CTLogListUpdateState.SIGNATURE_VERIFICATION_FAILED;
+
 import android.annotation.NonNull;
 import android.annotation.RequiresApi;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.net.Uri;
 import android.os.Build;
+import android.util.Log;
 
 import androidx.annotation.VisibleForTesting;
+
+import com.android.connectivity.resources.R;
+import com.android.server.connectivity.ConnectivityResources;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -33,18 +42,37 @@ import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.Base64;
+import java.util.HashSet;
 import java.util.Optional;
+import java.util.Set;
 
 /** Verifier of the log list signature. */
 @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
 public class SignatureVerifier {
 
+    private static final String TAG = "SignatureVerifier";
+
     private final Context mContext;
 
     @NonNull private Optional<PublicKey> mPublicKey = Optional.empty();
 
+    private final Set<PublicKey> mAllowedKeys = new HashSet<>();
+
     public SignatureVerifier(Context context) {
         mContext = context;
+    }
+
+    void loadAllowedKeys() {
+        try (InputStream input =
+                new ConnectivityResources(mContext).get().openRawResource(R.raw.ct_public_keys)) {
+            mAllowedKeys.addAll(PemReader.readKeysFrom(input));
+        } catch (GeneralSecurityException | IOException e) {
+            Log.e(TAG, "Error loading public keys", e);
+        }
+    }
+
+    void clearAllowedKeys() {
+        mAllowedKeys.clear();
     }
 
     @VisibleForTesting
@@ -63,29 +91,75 @@ public class SignatureVerifier {
     }
 
     void setPublicKey(String publicKey) throws GeneralSecurityException {
+        byte[] decodedPublicKey = null;
+        try {
+            decodedPublicKey = Base64.getDecoder().decode(publicKey);
+        } catch (IllegalArgumentException e) {
+            throw new GeneralSecurityException("Invalid public key base64 encoding", e);
+        }
         setPublicKey(
                 KeyFactory.getInstance("RSA")
-                        .generatePublic(
-                                new X509EncodedKeySpec(Base64.getDecoder().decode(publicKey))));
+                        .generatePublic(new X509EncodedKeySpec(decodedPublicKey)));
     }
 
     @VisibleForTesting
-    void setPublicKey(PublicKey publicKey) {
+    void setPublicKey(PublicKey publicKey) throws GeneralSecurityException {
+        if (!mAllowedKeys.contains(publicKey)) {
+            // TODO(b/400704086): add logging for this failure.
+            throw new GeneralSecurityException("Public key not in allowlist");
+        }
         mPublicKey = Optional.of(publicKey);
     }
 
-    boolean verify(Uri file, Uri signature) throws GeneralSecurityException, IOException {
+    LogListUpdateStatus verify(Uri file, Uri signature) {
+        LogListUpdateStatus.Builder statusBuilder = LogListUpdateStatus.builder();
+
         if (!mPublicKey.isPresent()) {
-            throw new InvalidKeyException("Missing public key for signature verification");
+            statusBuilder.setState(PUBLIC_KEY_NOT_FOUND);
+            Log.e(TAG, "No public key found for log list verification");
+            return statusBuilder.build();
         }
-        Signature verifier = Signature.getInstance("SHA256withRSA");
-        verifier.initVerify(mPublicKey.get());
+
         ContentResolver contentResolver = mContext.getContentResolver();
 
         try (InputStream fileStream = contentResolver.openInputStream(file);
                 InputStream signatureStream = contentResolver.openInputStream(signature)) {
+            Signature verifier = Signature.getInstance("SHA256withRSA");
+            verifier.initVerify(mPublicKey.get());
             verifier.update(fileStream.readAllBytes());
-            return verifier.verify(signatureStream.readAllBytes());
+
+            byte[] signatureBytes = signatureStream.readAllBytes();
+            statusBuilder.setSignature(new String(signatureBytes));
+
+            if (!verifier.verify(Base64.getDecoder().decode(signatureBytes))) {
+                // Leave the UpdateState as UNKNOWN_STATE if successful as there are other
+                // potential failures past the signature verification step
+                statusBuilder.setState(SIGNATURE_VERIFICATION_FAILED);
+            }
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "Invalid signature base64 encoding", e);
+            statusBuilder.setState(SIGNATURE_INVALID);
+            return statusBuilder.build();
+        } catch (InvalidKeyException e) {
+            Log.e(TAG, "Key invalid for log list verification", e);
+            statusBuilder.setState(SIGNATURE_INVALID);
+            return statusBuilder.build();
+        } catch (IOException | GeneralSecurityException e) {
+            Log.e(TAG, "Could not verify new log list", e);
+            statusBuilder.setState(SIGNATURE_VERIFICATION_FAILED);
+            return statusBuilder.build();
         }
+
+        // Double check if the signature is empty that we set the state correctly
+        if (!statusBuilder.build().hasSignature()) {
+            statusBuilder.setState(SIGNATURE_NOT_FOUND);
+        }
+
+        return statusBuilder.build();
+    }
+
+    @VisibleForTesting
+    boolean addAllowedKey(PublicKey publicKey) {
+        return mAllowedKeys.add(publicKey);
     }
 }

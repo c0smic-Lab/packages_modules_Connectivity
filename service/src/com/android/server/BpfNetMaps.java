@@ -25,6 +25,8 @@ import static android.net.BpfNetMapsConstants.DATA_SAVER_ENABLED_KEY;
 import static android.net.BpfNetMapsConstants.DATA_SAVER_ENABLED_MAP_PATH;
 import static android.net.BpfNetMapsConstants.IIF_MATCH;
 import static android.net.BpfNetMapsConstants.INGRESS_DISCARD_MAP_PATH;
+import static android.net.BpfNetMapsConstants.LOCAL_NET_ACCESS_MAP_PATH;
+import static android.net.BpfNetMapsConstants.LOCAL_NET_BLOCKED_UID_MAP_PATH;
 import static android.net.BpfNetMapsConstants.LOCKDOWN_VPN_MATCH;
 import static android.net.BpfNetMapsConstants.UID_OWNER_MAP_PATH;
 import static android.net.BpfNetMapsConstants.UID_PERMISSION_MAP_PATH;
@@ -36,17 +38,19 @@ import static android.net.ConnectivityManager.BLOCKED_METERED_REASON_MASK;
 import static android.net.ConnectivityManager.BLOCKED_REASON_NONE;
 import static android.net.ConnectivityManager.FIREWALL_RULE_ALLOW;
 import static android.net.ConnectivityManager.FIREWALL_RULE_DENY;
-import static android.net.INetd.PERMISSION_INTERNET;
-import static android.net.INetd.PERMISSION_NONE;
-import static android.net.INetd.PERMISSION_UNINSTALLED;
-import static android.net.INetd.PERMISSION_UPDATE_DEVICE_STATS;
 import static android.system.OsConstants.EINVAL;
 import static android.system.OsConstants.ENODEV;
 import static android.system.OsConstants.ENOENT;
 import static android.system.OsConstants.EOPNOTSUPP;
 
 import static com.android.server.ConnectivityStatsLog.NETWORK_BPF_MAP_INFO;
+import static com.android.server.connectivity.NetworkPermissions.PERMISSION_NONE;
+import static com.android.server.connectivity.NetworkPermissions.TRAFFIC_PERMISSION_INTERNET;
+import static com.android.server.connectivity.NetworkPermissions.TRAFFIC_PERMISSION_UNINSTALLED;
+import static com.android.server.connectivity.NetworkPermissions.TRAFFIC_PERMISSION_UPDATE_DEVICE_STATS;
 
+import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.app.StatsManager;
 import android.content.Context;
 import android.net.BpfNetMapsUtils;
@@ -74,6 +78,7 @@ import com.android.net.module.util.BpfMap;
 import com.android.net.module.util.IBpfMap;
 import com.android.net.module.util.SingleWriterBpfMap;
 import com.android.net.module.util.Struct;
+import com.android.net.module.util.Struct.Bool;
 import com.android.net.module.util.Struct.S32;
 import com.android.net.module.util.Struct.U32;
 import com.android.net.module.util.Struct.U8;
@@ -81,12 +86,15 @@ import com.android.net.module.util.bpf.CookieTagMapKey;
 import com.android.net.module.util.bpf.CookieTagMapValue;
 import com.android.net.module.util.bpf.IngressDiscardKey;
 import com.android.net.module.util.bpf.IngressDiscardValue;
+import com.android.net.module.util.bpf.LocalNetAccessKey;
+import com.android.server.connectivity.InterfaceTracker;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.StringJoiner;
 
@@ -131,10 +139,14 @@ public class BpfNetMaps {
     private static IBpfMap<S32, U8> sDataSaverEnabledMap = null;
     private static IBpfMap<IngressDiscardKey, IngressDiscardValue> sIngressDiscardMap = null;
 
+    private static IBpfMap<LocalNetAccessKey, Bool> sLocalNetAccessMap = null;
+    private static IBpfMap<U32, Bool> sLocalNetBlockedUidMap = null;
+
     private static final List<Pair<Integer, String>> PERMISSION_LIST = Arrays.asList(
-            Pair.create(PERMISSION_INTERNET, "PERMISSION_INTERNET"),
-            Pair.create(PERMISSION_UPDATE_DEVICE_STATS, "PERMISSION_UPDATE_DEVICE_STATS")
+            Pair.create(TRAFFIC_PERMISSION_INTERNET, "PERMISSION_INTERNET"),
+            Pair.create(TRAFFIC_PERMISSION_UPDATE_DEVICE_STATS, "PERMISSION_UPDATE_DEVICE_STATS")
     );
+    private final InterfaceTracker mInterfaceTracker;
 
     /**
      * Set configurationMap for test.
@@ -185,6 +197,25 @@ public class BpfNetMaps {
             IBpfMap<IngressDiscardKey, IngressDiscardValue> ingressDiscardMap) {
         sIngressDiscardMap = ingressDiscardMap;
     }
+
+    /**
+     * Set localNetAccessMap for test.
+     */
+    @VisibleForTesting
+    public static void setLocalNetAccessMapForTest(
+            IBpfMap<LocalNetAccessKey, Bool> localNetAccessMap) {
+        sLocalNetAccessMap = localNetAccessMap;
+    }
+
+    /**
+     * Set localNetBlockedUidMap for test.
+     */
+    @VisibleForTesting
+    public static void setLocalNetBlockedUidMapForTest(
+            IBpfMap<U32, Bool> localNetBlockedUidMap) {
+        sLocalNetBlockedUidMap = localNetBlockedUidMap;
+    }
+
 
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private static IBpfMap<S32, U32> getConfigurationMap() {
@@ -247,6 +278,26 @@ public class BpfNetMaps {
         }
     }
 
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    private static IBpfMap<U32, Bool> getLocalNetBlockedUidMap() {
+        try {
+            return SingleWriterBpfMap.getSingleton(LOCAL_NET_BLOCKED_UID_MAP_PATH,
+                    U32.class, Bool.class);
+        } catch (ErrnoException e) {
+            throw new IllegalStateException("Cannot open local_net_blocked_uid map", e);
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    private static IBpfMap<LocalNetAccessKey, Bool> getLocalNetAccessMap() {
+        try {
+            return SingleWriterBpfMap.getSingleton(LOCAL_NET_ACCESS_MAP_PATH,
+                    LocalNetAccessKey.class, Bool.class);
+        } catch (ErrnoException e) {
+            throw new IllegalStateException("Cannot open local_net_access map", e);
+        }
+    }
+
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private static void initBpfMaps() {
         if (sConfigurationMap == null) {
@@ -298,6 +349,27 @@ public class BpfNetMaps {
             sIngressDiscardMap.clear();
         } catch (ErrnoException e) {
             throw new IllegalStateException("Failed to initialize ingress discard map", e);
+        }
+
+        if (isAtLeast25Q2()) {
+            if (sLocalNetAccessMap == null) {
+                sLocalNetAccessMap = getLocalNetAccessMap();
+            }
+            try {
+                sLocalNetAccessMap.clear();
+            } catch (ErrnoException e) {
+                throw new IllegalStateException("Failed to initialize local_net_access map", e);
+            }
+
+            if (sLocalNetBlockedUidMap == null) {
+                sLocalNetBlockedUidMap = getLocalNetBlockedUidMap();
+            }
+            try {
+                sLocalNetBlockedUidMap.clear();
+            } catch (ErrnoException e) {
+                throw new IllegalStateException("Failed to initialize local_net_blocked_uid map",
+                        e);
+            }
         }
     }
 
@@ -356,23 +428,27 @@ public class BpfNetMaps {
 
     /** Constructor used after T that doesn't need to use netd anymore. */
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
-    public BpfNetMaps(final Context context) {
-        this(context, null);
+    public BpfNetMaps(final Context context, @NonNull final InterfaceTracker interfaceTracker) {
+        this(context, null, interfaceTracker);
 
         if (!SdkLevel.isAtLeastT()) throw new IllegalArgumentException("BpfNetMaps need to use netd before T");
     }
 
-    public BpfNetMaps(final Context context, final INetd netd) {
-        this(context, netd, new Dependencies());
+    public BpfNetMaps(final Context context, final INetd netd, @NonNull final InterfaceTracker
+            interfaceTracker) {
+        this(context, netd, new Dependencies(), interfaceTracker);
     }
 
     @VisibleForTesting
-    public BpfNetMaps(final Context context, final INetd netd, final Dependencies deps) {
+    public BpfNetMaps(final Context context, final INetd netd, final Dependencies deps,
+            @NonNull final  InterfaceTracker interfaceTracker) {
+        Objects.requireNonNull(interfaceTracker);
         if (SdkLevel.isAtLeastT()) {
             ensureInitialized(context);
         }
         mNetd = netd;
         mDeps = deps;
+        mInterfaceTracker = interfaceTracker;
     }
 
     private void maybeThrow(final int err, final String msg) {
@@ -385,6 +461,21 @@ public class BpfNetMaps {
         if (!SdkLevel.isAtLeastT()) {
             throw new UnsupportedOperationException(msg);
         }
+    }
+
+    private void throwIfPre25Q2(final String msg) {
+        if (!isAtLeast25Q2()) {
+            throw new UnsupportedOperationException(msg);
+        }
+    }
+
+    /*
+     ToDo : Remove this method when SdkLevel.isAtLeastB() is fixed, aosp is at sdk level 36 or use
+     NetworkStackUtils.isAtLeast25Q2 when it is moved to a static lib.
+     */
+    public static boolean isAtLeast25Q2() {
+        return SdkLevel.isAtLeastB()  || (SdkLevel.isAtLeastV()
+                && "Baklava".equals(Build.VERSION.CODENAME));
     }
 
     private void removeRule(final int uid, final long match, final String caller) {
@@ -788,7 +879,8 @@ public class BpfNetMaps {
         }
 
         // Remove the entry if package is uninstalled or uid has only INTERNET permission.
-        if (permissions == PERMISSION_UNINSTALLED || permissions == PERMISSION_INTERNET) {
+        if (permissions == TRAFFIC_PERMISSION_UNINSTALLED
+                || permissions == TRAFFIC_PERMISSION_INTERNET) {
             for (final int uid : uids) {
                 try {
                     sUidPermissionMap.deleteEntry(new S32(uid));
@@ -810,6 +902,161 @@ public class BpfNetMaps {
     }
 
     /**
+     * Add configuration to local_net_access trie map.
+     * @param lpmBitlen prefix length that will be used for longest matching
+     * @param iface interface name
+     * @param address remote address. ipv4 addresses would be mapped to v6
+     * @param protocol required for longest match in special cases
+     * @param remotePort src/dst port for ingress/egress
+     * @param isAllowed is the local network call allowed or blocked.
+     */
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    public void addLocalNetAccess(final int lpmBitlen, @Nullable final String iface,
+            final InetAddress address, final int protocol, final int remotePort,
+            final boolean isAllowed) {
+        throwIfPre25Q2("addLocalNetAccess is not available on pre-B devices");
+        if (iface == null) {
+            Log.e(TAG, "Null iface, skip addLocalNetAccess for " + address);
+            return;
+        }
+        int ifIndex = mInterfaceTracker.getInterfaceIndex(iface);
+        if (ifIndex == 0) {
+            mInterfaceTracker.addInterface(iface);
+            ifIndex = mInterfaceTracker.getInterfaceIndex(iface);
+        }
+        if (ifIndex == 0) {
+            Log.e(TAG, "Failed to get if index, skip addLocalNetAccess for " + address
+                    + "(" + iface + ")");
+            return;
+        }
+        final LocalNetAccessKey localNetAccessKey = new LocalNetAccessKey(lpmBitlen, ifIndex,
+                address, protocol, remotePort);
+
+        try {
+            sLocalNetAccessMap.updateEntry(localNetAccessKey, new Bool(isAllowed));
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to add local network access for localNetAccessKey : "
+                    + localNetAccessKey + ", isAllowed : " + isAllowed);
+        }
+    }
+
+    /**
+     * Remove configuration to local_net_access trie map.
+     * @param lpmBitlen prefix length that will be used for longest matching
+     * @param iface interface name
+     * @param address remote address. ipv4 addresses would be mapped to v6
+     * @param protocol required for longest match in special cases
+     * @param remotePort src/dst port for ingress/egress
+     */
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    public void removeLocalNetAccess(final int lpmBitlen, @Nullable final String iface,
+            final InetAddress address, final int protocol, final int remotePort) {
+        throwIfPre25Q2("removeLocalNetAccess is not available on pre-B devices");
+        final int ifIndex;
+        if (iface == null) {
+            ifIndex = 0;
+        } else {
+            ifIndex = mInterfaceTracker.getInterfaceIndex(iface);
+        }
+        if (ifIndex == 0) {
+            Log.e(TAG, "Failed to get if index, skip removeLocalNetAccess for " + address
+                    + "(" + iface + ")");
+            return;
+        }
+        final LocalNetAccessKey localNetAccessKey = new LocalNetAccessKey(lpmBitlen, ifIndex,
+                address, protocol, remotePort);
+
+        try {
+            sLocalNetAccessMap.deleteEntry(localNetAccessKey);
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to remove local network access for localNetAccessKey : "
+                    + localNetAccessKey);
+        }
+    }
+
+    /**
+     * Fetches value available in local_net_access bpf map for provided configuration
+     * @param lpmBitlen  prefix length that will be used for longest matching
+     * @param iface    interface name
+     * @param address    remote address. ipv4 addresses would be mapped to v6
+     * @param protocol   required for longest match in special cases
+     * @param remotePort src/dst port for ingress/egress
+     * @return false if the configuration is disallowed, true if the configuration is absent i.e. it
+     * is not local network or if configuration is allowed like local dns servers.
+     */
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    public boolean getLocalNetAccess(final int lpmBitlen, @Nullable final String iface,
+            final InetAddress address, final int protocol, final int remotePort) {
+        throwIfPre25Q2("getLocalNetAccess is not available on pre-B devices");
+        final int ifIndex;
+        if (iface == null) {
+            ifIndex = 0;
+        } else {
+            ifIndex = mInterfaceTracker.getInterfaceIndex(iface);
+        }
+        if (ifIndex == 0) {
+            Log.e(TAG, "Failed to get if index, returning default from getLocalNetAccess for "
+                    + address + "(" + iface + ")");
+            return true;
+        }
+        final LocalNetAccessKey localNetAccessKey = new LocalNetAccessKey(lpmBitlen, ifIndex,
+                address, protocol, remotePort);
+        try {
+            final Bool value = sLocalNetAccessMap.getValue(localNetAccessKey);
+            return value == null ? true : value.val;
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to find local network access configuration for "
+                    + "localNetAccessKey : " + localNetAccessKey);
+        }
+        return true;
+    }
+
+    /**
+     * Add uid to local_net_blocked_uid map.
+     * @param uid application uid that needs to block local network calls.
+     */
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    public void addUidToLocalNetBlockMap(final int uid) {
+        throwIfPre25Q2("addUidToLocalNetBlockMap is not available on pre-B devices");
+        try {
+            sLocalNetBlockedUidMap.updateEntry(new U32(uid), new Bool(true));
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to add local network blocked for uid : " + uid);
+        }
+    }
+
+    /**
+     * True if local network calls are blocked for application.
+     * @param uid application uid that needs check if local network calls are blocked.
+     */
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    public boolean isUidBlockedFromUsingLocalNetwork(final int uid) {
+        throwIfPre25Q2("isUidBlockedFromUsingLocalNetwork is not available on pre-B devices");
+        try {
+            final Bool value = sLocalNetBlockedUidMap.getValue(new U32(uid));
+            return value == null ? false : value.val;
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to find uid(" + uid
+                    + ") is present in local network blocked map");
+        }
+        return false;
+    }
+
+    /**
+     * Remove uid from local_net_blocked_uid map(if present).
+     * @param uid application uid that needs check if local network calls are blocked.
+     */
+    @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+    public void removeUidFromLocalNetBlockMap(final int uid) {
+        throwIfPre25Q2("removeUidFromLocalNetBlockMap is not available on pre-B devices");
+        try {
+            sLocalNetBlockedUidMap.deleteEntry(new U32(uid));
+        } catch (ErrnoException e) {
+            Log.e(TAG, "Failed to remove uid(" + uid + ") from local network blocked map");
+        }
+    }
+
+    /**
      * Get granted permissions for specified uid. If uid is not in the map, this method returns
      * {@link android.net.INetd.PERMISSION_INTERNET} since this is a default permission.
      * See {@link #setNetPermForUids}
@@ -824,10 +1071,10 @@ public class BpfNetMaps {
             // Key of uid permission map is appId
             // TODO: Rename map name
             final U8 permissions = sUidPermissionMap.getValue(new S32(appId));
-            return permissions != null ? permissions.val : PERMISSION_INTERNET;
+            return permissions != null ? permissions.val : TRAFFIC_PERMISSION_INTERNET;
         } catch (ErrnoException e) {
             Log.wtf(TAG, "Failed to get permission for uid: " + uid);
-            return PERMISSION_INTERNET;
+            return TRAFFIC_PERMISSION_INTERNET;
         }
     }
 
@@ -976,7 +1223,7 @@ public class BpfNetMaps {
         if (permissionMask == PERMISSION_NONE) {
             return "PERMISSION_NONE";
         }
-        if (permissionMask == PERMISSION_UNINSTALLED) {
+        if (permissionMask == TRAFFIC_PERMISSION_UNINSTALLED) {
             // PERMISSION_UNINSTALLED should never appear in the map
             return "PERMISSION_UNINSTALLED error!";
         }
@@ -1079,6 +1326,14 @@ public class BpfNetMaps {
                     (key, value) -> "[" + key.dstAddr + "]: "
                             + value.iif1 + "(" + mDeps.getIfName(value.iif1) + "), "
                             + value.iif2 + "(" + mDeps.getIfName(value.iif2) + ")");
+            if (sLocalNetBlockedUidMap != null) {
+                BpfDump.dumpMap(sLocalNetAccessMap, pw, "sLocalNetAccessMap (default is true meaning global)",
+                        (key, value) -> "" + key + ": " + value.val);
+            }
+            if (sLocalNetBlockedUidMap != null) {
+                BpfDump.dumpMap(sLocalNetBlockedUidMap, pw, "sLocalNetBlockedUidMap",
+                        (key, value) -> "" + key + ": " + value.val);
+            }
             dumpDataSaverConfig(pw);
             pw.decreaseIndent();
         }

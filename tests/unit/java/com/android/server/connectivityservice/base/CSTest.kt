@@ -18,6 +18,7 @@ package com.android.server
 
 import android.app.AlarmManager
 import android.app.AppOpsManager
+import android.bluetooth.BluetoothManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -67,10 +68,12 @@ import com.android.server.connectivity.AutomaticOnOffKeepaliveTracker
 import com.android.server.connectivity.CarrierPrivilegeAuthenticator
 import com.android.server.connectivity.ClatCoordinator
 import com.android.server.connectivity.ConnectivityFlags
+import com.android.server.connectivity.InterfaceTracker
 import com.android.server.connectivity.MulticastRoutingCoordinatorService
 import com.android.server.connectivity.MultinetworkPolicyTracker
 import com.android.server.connectivity.MultinetworkPolicyTrackerTestDependencies
 import com.android.server.connectivity.NetworkRequestStateStatsMetrics
+import com.android.server.connectivity.PermissionMonitor
 import com.android.server.connectivity.ProxyTracker
 import com.android.server.connectivity.SatelliteAccessController
 import com.android.testutils.visibleOnHandlerThread
@@ -109,7 +112,8 @@ internal const val VERSION_S = 2
 internal const val VERSION_T = 3
 internal const val VERSION_U = 4
 internal const val VERSION_V = 5
-internal const val VERSION_MAX = VERSION_V
+internal const val VERSION_B = 6
+internal const val VERSION_MAX = VERSION_B
 
 internal const val CALLING_UID_UNMOCKED = Process.INVALID_UID
 
@@ -166,6 +170,7 @@ open class CSTest {
         it[ConnectivityFlags.DELAY_DESTROY_SOCKETS] = true
         it[ConnectivityFlags.USE_DECLARED_METHODS_FOR_CALLBACKS] = true
         it[ConnectivityFlags.QUEUE_CALLBACKS_FOR_FROZEN_APPS] = true
+        it[ConnectivityFlags.QUEUE_NETWORK_AGENT_EVENTS_IN_SYSTEM_SERVER] = true
     }
     fun setFeatureEnabled(flag: String, enabled: Boolean) = enabledFeatures.set(flag, enabled)
 
@@ -191,6 +196,7 @@ open class CSTest {
     val connResources = makeMockConnResources(sysResources, packageManager)
 
     val netd = mock<INetd>()
+    val interfaceTracker = mock<InterfaceTracker>()
     val bpfNetMaps = mock<BpfNetMaps>().also {
         doReturn(PERMISSION_INTERNET).`when`(it).getNetPermForUid(anyInt())
     }
@@ -209,12 +215,14 @@ open class CSTest {
         doReturn(true).`when`(it).isDataCapable()
     }
     val subscriptionManager = mock<SubscriptionManager>()
+    val bluetoothManager = mock<BluetoothManager>()
 
     val multicastRoutingCoordinatorService = mock<MulticastRoutingCoordinatorService>()
     val satelliteAccessController = mock<SatelliteAccessController>()
     val destroySocketsWrapper = mock<DestroySocketsWrapper>()
 
     val deps = CSDeps()
+    val permDeps = PermDeps()
 
     // Initializations that start threads are done from setUp to avoid thread leak
     lateinit var alarmHandlerThread: HandlerThread
@@ -251,7 +259,9 @@ open class CSTest {
 
         alarmHandlerThread = HandlerThread("TestAlarmManager").also { it.start() }
         alarmManager = makeMockAlarmManager(alarmHandlerThread)
-        service = makeConnectivityService(context, netd, deps).also { it.systemReadyInternal() }
+        service = makeConnectivityService(context, netd, deps, permDeps).also {
+            it.systemReadyInternal()
+        }
         cm = ConnectivityManager(context, service)
         // csHandler initialization must be after makeConnectivityService since ConnectivityService
         // constructor starts csHandlerThread
@@ -273,7 +283,11 @@ open class CSTest {
 
     inner class CSDeps : ConnectivityService.Dependencies() {
         override fun getResources(ctx: Context) = connResources
-        override fun getBpfNetMaps(context: Context, netd: INetd) = this@CSTest.bpfNetMaps
+        override fun getBpfNetMaps(
+            context: Context,
+            netd: INetd,
+            interfaceTracker: InterfaceTracker
+        ) = this@CSTest.bpfNetMaps
         override fun getClatCoordinator(netd: INetd?) = this@CSTest.clatCoordinator
         override fun getNetworkStack() = this@CSTest.networkStack
 
@@ -375,6 +389,7 @@ open class CSTest {
         override fun isAtLeastT() = if (isSdkUnmocked) super.isAtLeastT() else sdkLevel >= VERSION_T
         override fun isAtLeastU() = if (isSdkUnmocked) super.isAtLeastU() else sdkLevel >= VERSION_U
         override fun isAtLeastV() = if (isSdkUnmocked) super.isAtLeastV() else sdkLevel >= VERSION_V
+        override fun isAtLeastB() = if (isSdkUnmocked) super.isAtLeastB() else sdkLevel >= VERSION_B
 
         private var callingUid = CALLING_UID_UNMOCKED
 
@@ -393,6 +408,12 @@ open class CSTest {
             // Call mocked destroyLiveTcpSocketsByOwnerUids so that test can verify this method call
             destroySocketsWrapper.destroyLiveTcpSocketsByOwnerUids(ownerUids)
         }
+
+        override fun makeL2capNetworkProvider(context: Context) = null
+    }
+
+    inner class PermDeps : PermissionMonitor.Dependencies() {
+        override fun shouldEnforceLocalNetRestrictions(uid: Int) = false
     }
 
     inner class CSContext(base: Context) : BroadcastInterceptingContext(base) {
@@ -503,6 +524,7 @@ open class CSTest {
             Context.BATTERY_STATS_SERVICE -> batteryManager
             Context.STATS_MANAGER -> null // Stats manager is final and can't be mocked
             Context.APP_OPS_SERVICE -> appOpsManager
+            Context.BLUETOOTH_SERVICE -> bluetoothManager
             else -> super.getSystemService(serviceName)
         }
 

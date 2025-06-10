@@ -37,7 +37,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.Matchers.eq;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.when;
 
@@ -63,6 +63,7 @@ import com.android.internal.util.test.BroadcastInterceptingContext;
 import com.android.internal.util.test.FakeSettingsProvider;
 import com.android.modules.utils.build.SdkLevel;
 import com.android.net.module.util.DeviceConfigUtils;
+import com.android.net.module.util.SdkUtil;
 import com.android.net.module.util.SharedLog;
 import com.android.testutils.DevSdkIgnoreRule;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreAfter;
@@ -157,6 +158,11 @@ public class TetheringConfigurationTest {
         @Override
         boolean isFeatureEnabled(@NonNull Context context, @NonNull String name) {
             return isMockFlagEnabled(name, false /* defaultEnabled */);
+        }
+
+        @Override
+        boolean isFeatureNotChickenedOut(@NonNull Context context, @NonNull String name) {
+            return isMockFlagEnabled(name, true /* defaultEnabled */);
         }
 
         @Override
@@ -767,14 +773,17 @@ public class TetheringConfigurationTest {
 
     @Test
     public void testEnableSyncSMFlag() throws Exception {
-        // Test default disabled
+        // Test default enabled
         setTetherEnableSyncSMFlagEnabled(null);
-        assertEnableSyncSM(false);
+        assertEnableSyncSM(true);
 
         setTetherEnableSyncSMFlagEnabled(true);
         assertEnableSyncSM(true);
 
-        setTetherEnableSyncSMFlagEnabled(false);
-        assertEnableSyncSM(false);
+        // Feature is enabled by default after 25Q2 release.
+        if (!SdkUtil.isAtLeast25Q2()) {
+            setTetherEnableSyncSMFlagEnabled(false);
+            assertEnableSyncSM(false);
+        }
     }
 }
